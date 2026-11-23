@@ -389,3 +389,25 @@ $ bun run build       # dist/index.js 222.92 KB
 ```
 
 **偏差**：无。
+
+## 十九、复审修正 R13（对应 REVIEW.md「第十三轮终审 · a0a610a」S1/S2）
+
+复审对象：`a0a610a`。R2/N1/标记移除/五组对照已关闭；本轮修复 R12 引入的两处回归。
+
+| 项 | 修正 | 断言 |
+|----|------|------|
+| S1（括号分组展开被丢） | 预扫描的组序号改为镜像 `commandGroups` 的**发射语义**：只有非空段被发射时才递增（`(` 前无内容不占序号），括号分组内的展开绑定到实际产生的命令段，不再静默丢弃 | `parenthesized groups keep their heredoc expansions (S1)`：`( cd sub; cat <<EOF … )` 中 `$(cat note)` 在 sub 下计入且非 undeterminable；根 cwd 下 `( cat <<EOF … )` 的 `rootnote` 同样保留 |
+| S2（逐行破坏跨行语义） | 工作项改为**逻辑命令**：引号/反斜杠续行状态跨物理行携带，续行或引号未闭合时并入同一工作项；每个工作项先 `normalize`（恢复注释剥离）；**无 heredoc 的输入直接返回单一整段工作项**，与原管线逐字节一致；`normalize` 新增 bash 续行折叠（单引号外 `\`+换行删除），`cat no\<换行>te` 得单目标 `note` | `heredoc-free input keeps whole-text multi-line semantics (S2)`：跨行引号 `cat "a\nb"` 单目标、续行 `note`、注释行不产生 privileged-exec、行尾注释不算文件、heredoc 与跨行引号命令混合时 `multi\nline` 保留 |
+
+**复审修正 R13 后验证**：
+
+```
+$ bun run typecheck   # tsc --noEmit → clean
+$ bun test src
+ 277 pass
+ 0 fail
+Ran 277 tests across 14 files.
+$ bun run build       # dist/index.js 224.37 KB
+```
+
+**偏差**：无。
