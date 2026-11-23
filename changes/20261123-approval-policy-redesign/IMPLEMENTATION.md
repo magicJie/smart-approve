@@ -411,3 +411,25 @@ $ bun run build       # dist/index.js 224.37 KB
 ```
 
 **偏差**：无。
+
+## 二十、复审修正 R14（对应 REVIEW.md「第十四轮终审 · ecdcc20」T1/T2）
+
+复审对象：`ecdcc20`。本轮 T1/T2 必修交付。
+
+| 项 | 修正 | 断言 |
+|----|------|------|
+| T1（续行+括号组序号错位） | `splitHeredocWork` 在扫描前用与 `normalize` 相同的状态机折叠续行——预扫描与消费端看到完全一致的段内容，"段内是否有内容"判定不再因续行反斜杠错位；展开绑定实际生成的逻辑命令段 | `single-line and continued parenthesized forms agree exactly (T1)`：单行与续行两种括号分组形式的目标集、完整性标志完全相同，且 `note` 目标保留 |
+| T2（折叠早于注释/转义吞行） | 新增 `collapseLineContinuations` 统一词法状态机：仅在单引号外、非注释中、`\` 未被自身转义时折叠续行；注释尾 `\` 不再把下一行并入注释、行末 `\\` 保留字面反斜杠+真实换行、双引号内撇号不翻转单引号状态；`normalize`（含决策记忆键）与预扫描共用该状态机 | `comment backslash, escaped backslash, and quoted apostrophe follow bash (T2)`：注释尾 `\` 后 `cat other` 照常计入、`note\\` 后下一行仍执行、 `"it's \`+换行` 折叠为单目标 `it's note`、续行管道与普通管道行为标签一致 |
+
+**复审修正 R14 后验证**：
+
+```
+$ bun run typecheck   # tsc --noEmit → clean
+$ bun test src
+ 279 pass
+ 0 fail
+Ran 279 tests across 14 files.
+$ bun run build       # dist/index.js 225.27 KB
+```
+
+**偏差**：无。
