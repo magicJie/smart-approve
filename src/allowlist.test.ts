@@ -274,3 +274,30 @@ test("rememberPermanent writes exact tool/key/cwd/timestamp entries", () => {
     cleanup(dir);
   }
 });
+
+test("domain entries see sort/git file targets and reject out-of-domain operands", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "smart-approve-sortdom-"));
+  const domain = path.join(root, "domain");
+  const outside = path.join(root, "outside");
+  try {
+    fs.mkdirSync(domain); fs.mkdirSync(outside);
+    const { list } = makeList([
+      { tool: "bash", key: "sort", cwd: root, timestamp: "t", domain },
+    ]);
+    // sort input+output in-domain → allowed.
+    assert.equal(
+      list.isAllowed("bash", `sort -o ${domain}/out.tsv ${domain}/in.tsv`, root),
+      true,
+    );
+    // sort operand outside the domain → domain check fails → not allowed.
+    assert.equal(
+      list.isAllowed("bash", `sort -o ${domain}/out.tsv ${outside}/in.tsv`, root),
+      false,
+    );
+    // git -C outside the domain → not allowed.
+    assert.equal(list.isAllowed("bash", `git -C ${outside} status`, root), false);
+    assert.equal(list.isAllowed("bash", `git -C ${domain} status`, root), true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

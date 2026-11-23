@@ -202,20 +202,25 @@ export function isUserWritablePath(
   );
 }
 
-/** Resolve a local path and its symlinked ancestors, including missing write targets. */
+/** Resolve a local path and its symlinked ancestors, including missing write targets.
+ *  `expandHome:false` treats `~`/`$HOME` as ordinary characters — pass it when
+ *  the caller already applied quoting-aware expansion (R6). */
 export function resolveFilesystemPathCandidates(
   filePath: string,
   baseCwd = process.cwd(),
+  options: { expandHome?: boolean } = {},
 ): string[] {
   if (!filePath) return [];
   if (/^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(filePath)) return [filePath];
 
   const home = process.env.HOME || os.homedir();
-  const expanded = filePath === "~"
-    ? home
-    : filePath.startsWith("~/")
-      ? path.join(home, filePath.slice(2))
-      : filePath;
+  const expandHome = options.expandHome !== false;
+  const expanded = !expandHome ? filePath
+    : filePath === "~"
+      ? home
+      : filePath.startsWith("~/")
+        ? path.join(home, filePath.slice(2))
+        : filePath;
   const absolutePath = path.resolve(baseCwd, expanded);
   const missingSegments: string[] = [];
   let ancestor = absolutePath;

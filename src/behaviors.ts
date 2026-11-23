@@ -617,6 +617,8 @@ function hasSensitiveAccountFileReference(name: string, args: string[]): boolean
 
 
 
+/** Raw redirection targets per stage — the token is returned verbatim
+ *  (quotes intact) so the caller can honor literal quoting via pathArg (R6). */
 function redirectionTargets(segment: string): string[] {
   const targets: string[] = [];
   let quote: string | undefined;
@@ -645,20 +647,21 @@ function redirectionTargets(segment: string): string[] {
     while (/\s/.test(segment[cursor] ?? "")) cursor++;
     if (segment[cursor] === "&" || segment[cursor] === "|") continue;
 
-    let target = "";
+    const start = cursor;
     const targetQuote = segment[cursor];
     if (targetQuote === "'" || targetQuote === "\"") {
       cursor++;
       while (cursor < segment.length && segment[cursor] !== targetQuote) {
         if (segment[cursor] === "\\" && targetQuote === "\"" && cursor + 1 < segment.length) cursor++;
-        target += segment[cursor++];
+        cursor++;
       }
       if (segment[cursor] === targetQuote) cursor++;
     } else {
       while (cursor < segment.length && !/[\s;&|()<>\n]/.test(segment[cursor])) {
-        target += segment[cursor++];
+        cursor++;
       }
     }
+    const target = segment.slice(start, cursor);
     if (target) targets.push(target);
     index = cursor - 1;
   }
@@ -905,8 +908,12 @@ function expandHomeLiteral(value: string, home: string): string | undefined {
  * filesystem actually does.  Falls back to the lexical candidate list when
  * the prefix doesn't exist.
  */
-function semanticPathCandidates(target: string, baseCwd: string): string[] {
-  const lexical = resolveFilesystemPathCandidates(target, baseCwd);
+function semanticPathCandidates(
+  target: string,
+  baseCwd: string,
+  options: { expandHome?: boolean } = {},
+): string[] {
+  const lexical = resolveFilesystemPathCandidates(target, baseCwd, options);
   if (!path.isAbsolute(target) && !path.isAbsolute(baseCwd)) return lexical;
   const absolute = path.isAbsolute(target) ? target : `${baseCwd}/${target}`;
   // Original components (pre-`..` folding) so a `..` right after a symlinked
@@ -1018,7 +1025,7 @@ function permissionChangeTier(
       let refOther = false;
       if (refPath !== undefined) {
         const refCandidates = cwdKnown
-          ? semanticPathCandidates(refPath, cwd)
+          ? semanticPathCandidates(refPath, cwd, { expandHome: false })
           : [refPath];
         try {
           const stat = fs.statSync(refCandidates[refCandidates.length - 1] ?? refPath);
@@ -1036,11 +1043,12 @@ function permissionChangeTier(
   const homeCandidates = resolveFilesystemPathCandidates(home, home);
   for (const target of targets) {
     const expanded = expandPathTarget(target, home);
+
     if (expanded === undefined) continue; // dynamic — reviewable, LLM judges
     if (isSystemTarget(expanded)) return "permission-change-system";
     const candidates = cwdKnown
-      ? semanticPathCandidates(expanded, cwd)
-      : resolveFilesystemPathCandidates(expanded, home);
+      ? semanticPathCandidates(expanded, cwd, { expandHome: false })
+      : resolveFilesystemPathCandidates(expanded, home, { expandHome: false });
     for (const candidate of candidates) {
       if (isSystemTarget(candidate)) return "permission-change-system";
       if (homeCandidates.some((root) => candidate === root)) {
@@ -1074,7 +1082,7 @@ const FILE_OPTION_VALUE: Record<string, ReadonlySet<string>> = {
     "--ca-directory", "--post-file", "--load-cookies", "--save-cookies"]),
   sort: new Set(["-o", "--output", "-T", "--temporary-directory",
     "--random-source", "--files0-from"]),
-  git: new Set(["-C", "--git-dir", "--work-tree", "-c"]),
+  git: new Set(["-C", "--git-dir", "--work-tree"]),
   ssh: new Set(["-i", "-F"]),
 };
 
@@ -1112,12 +1120,12 @@ const NON_FILE_COMMANDS: ReadonlySet<string> = new Set([
   "return", "eval", "source", ".", "exec", "time", "times", "ulimit",
   "umask", "trap", "shift", "getopts", "read", "echo-e", "seq", "yes",
   "xargs", "nohup", "nice", "timeout", "watch", "clear", "reset",
-  "git", "gh", "npm", "npx", "pnpm", "yarn", "bun", "deno", "pip", "pip3",
+  "gh", "npm", "npx", "pnpm", "yarn", "bun", "deno", "pip", "pip3",
   "python3", "python", "node", "ruby", "perl", "php", "lua", "docker",
   "kubectl", "systemctl", "service", "scp",
   "openssl", "nc", "netcat", "ncat", "socat", "telnet", "ping", "dig",
   "nslookup", "host", "traceroute", "grep", "rg", "egrep", "fgrep", "sed",
-  "awk", "gawk", "diff", "wc", "sort", "uniq", "comm", "cut", "tr", "head",
+  "awk", "gawk", "diff", "wc", "uniq", "comm", "cut", "tr", "head",
   "tail", "less", "more", "man", "info", "apropos", "fd", "rg", "jq", "yq",
 ]);
 
@@ -1249,6 +1257,22 @@ function fileTargetsOfInvocation(
       complete,
     };
   }
+  if (name === "sort") {
+    // Option VALUES and bare operands are all files (input files).
+    const { targets, complete } = stageFileOptionTargets(name, rawArgs);
+    const skip = new Set<string>([
+      ...(FILE_OPTION_VALUE.sort ?? []),
+      ...(NONFILE_OPTION_VALUE.sort ?? []),
+    ]);
+    const operands = stagePathArgs(rawArgs, skip);
+    return { targets: [...targets, ...operands], complete };
+  }
+  if (name === "git") {
+    // Only file-valued options are paths (-C/--git-dir/--work-tree); the
+    // subcommand and its operands are repo objects, not local files.
+    const { targets, complete } = stageFileOptionTargets(name, rawArgs);
+    return { targets, complete };
+  }
   if (NON_FILE_COMMANDS.has(name)) return { targets: [], complete: true };
 
   // Filesystem utilities: every operand is a path.
@@ -1335,7 +1359,7 @@ export function commandFileTargets(
             cwdKnown = false;
             continue;
           }
-          const candidates = semanticPathCandidates(expanded, currentCwd);
+          const candidates = semanticPathCandidates(expanded, currentCwd, { expandHome: false });
           currentCwd = candidates[candidates.length - 1] ?? expanded;
           continue;
         }
@@ -1355,7 +1379,7 @@ export function commandFileTargets(
         // Redirection targets are filesystem targets too (R2); /dev/null
         // is the universal sink and carries no domain risk.
         for (const raw of redirectionTargets(stage)) {
-          const expanded = expandHomeLiteral(raw, home);
+          const expanded = expandPathTarget(pathArg(raw), home);
           if (expanded === undefined) {
             undeterminable = true;
             continue;
@@ -1855,7 +1879,8 @@ export function analyzeCommand(cmd: string): DangerAnalysis {
         behaviorSet.add("kubectl-delete");
       }
 
-      for (const target of redirectionTargets(segment)) {
+      for (const rawTarget of redirectionTargets(segment)) {
+        const target = unquoteToken(rawTarget);
         const normalized = target.replace(/\\/g, "/");
         const sensitiveSystemWrite =
           /^(?:\/private)?\/etc\/(?:passwd|shadow|sudoers|hosts)(?:$|[./])/i.test(normalized) ||
@@ -1958,7 +1983,7 @@ export function analyzeBashOperation(
             cwdKnown = false;
             continue;
           }
-          const candidates = semanticPathCandidates(expanded, currentCwd);
+          const candidates = semanticPathCandidates(expanded, currentCwd, { expandHome: false });
           currentCwd = candidates[candidates.length - 1] ?? expanded;
           continue;
         }
@@ -1980,7 +2005,7 @@ export function analyzeBashOperation(
               continue;
             }
             const candidates = cwdKnown
-              ? semanticPathCandidates(expanded, currentCwd)
+              ? semanticPathCandidates(expanded, currentCwd, { expandHome: false })
               : [expanded];
             const blockDevice = candidates.some(
               (candidate) =>

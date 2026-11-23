@@ -6,6 +6,7 @@ import * as path from "node:path";
 import {
   analyzeBashOperation,
   analyzeCommand,
+  commandFileTargets,
   isSensitiveWorkingDirectory,
 } from "./behaviors.ts";
 
@@ -815,4 +816,49 @@ test("wrapper unwrap handles combined -c and ssh remote command lines", () => {
   const sshReboot = analyzeCommand("ssh host 'meeting; reboot later'");
   assert.ok(sshReboot.behaviors.includes("shutdown-reboot"), "remote reboot detected");
   assert.equal(sshReboot.hardBlocked, false);
+});
+
+// ── REVIEW R2/R6 (终审): routing + literal tilde ──────────────────────
+
+test("sort and git route their file targets out of the non-file table", () => {
+  // sort: -o option value AND bare operand are both targets.
+  const sort = commandFileTargets("sort -o out.tsv notes.tsv", "/work");
+  assert.deepEqual(
+    sort.targets.map((t) => t.value).sort(),
+    ["notes.tsv", "out.tsv"],
+  );
+  assert.deepEqual(sort.targets.map((t) => t.cwd), ["/work", "/work"]);
+  assert.equal(sort.undeterminable, false);
+
+  // git: -C is a filesystem dir; the subcommand operands are not files.
+  const git = commandFileTargets("git -C /repo status", "/work");
+  assert.deepEqual(git.targets.map((t) => t.value), ["/repo"]);
+  assert.equal(git.undeterminable, false);
+
+  const gitNoC = commandFileTargets("git -c color.ui=always status", "/work");
+  assert.deepEqual(gitNoC.targets, []);
+});
+
+test("literal tilde and HOME quoting are honored end to end", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "smart-approve-tilde-"));
+  try {
+    fs.writeFileSync(path.join(root, "~"), "x");
+    // chmod "~" targets a literal file named ~ — reviewable, not the
+    // home-root hard block.  chmod ~ (unquoted) still expands and blocks.
+    const quoted = analyzeBashOperation('chmod 777 "~"', root, root);
+    assert.ok(quoted.behaviors.includes("permission-change-user"), "~ literal must be user tier");
+    assert.equal(quoted.hardBlocked, false);
+    const bare = analyzeBashOperation("chmod 777 ~", root, root);
+    assert.ok(bare.behaviors.includes("permission-change-system"));
+    assert.equal(bare.hardBlocked, true);
+
+    // Quoted redirection targets keep their literal value for domain
+    // extraction; unquoted $HOME still expands.
+    const redir = commandFileTargets("echo hi >'$HOME/out'", root);
+    assert.deepEqual(redir.targets.map((t) => t.value), ["$HOME/out"]);
+    const redirVar = commandFileTargets("echo hi >$HOME/out", root);
+    assert.equal(redirVar.targets.length, 1);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
 });
