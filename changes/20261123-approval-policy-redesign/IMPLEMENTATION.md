@@ -251,3 +251,26 @@ $ bun run build       # dist/index.js 216.34 KB
 ```
 
 **偏差**：无。
+
+## 十三、复审修正 R7（对应 REVIEW.md「第七轮终审 · d0ffe2e」Y1–Y3）
+
+复审对象：`d0ffe2e`。X2/X3 已关闭；本轮 Y1/Y2 必修 + Y3（X5 非阻断残留）交付。
+
+| 项 | 修正 | 断言 |
+|----|------|------|
+| Y1（按完整 shell 词实际值判 fd/文件） | `redirectionTargets` 操作数改为读取完整 shell 词（引号/非引号片段拼接），fd 判定用求值后的值 + 左侧描述符：`>"2026".log`/`>"2026.log"`/裸 `2026.log` 同目标；`>&"2"` 仍是 fd 复制；显式左描述符 + 非 fd 词（`2>&2026.log`）按 bash `ambiguous redirect` 判无效 → undeterminable，不伪造文件目标；新增 `paths.ts:evaluateShellWord` 处理混合片段，`pathArg` 与 fd 词判定统一使用 | `redirect operands are judged by evaluated word value + left fd (Y1)`：三种引号写法同目标集、`>&"2"`/`>&'1'` 无目标、`2>&2026.log` 与 `2>&"out.log"` undeterminable、无左描述符的 `>&2026.log` 仍为文件写；X1 旧断言同步按 Y1 语义更新 |
+| Y2（here-string vs heredoc 队列） | `stripHeredocBodies` 正则分治：`<<<` 为 here-string（无结束词、无正文行，直接 continue 不入队），`<<`/`<<-` 为 heredoc（分隔词入队）；分隔词前允许空白、支持单/双引号分隔词 | `here-strings queue no body; heredocs allow spaced/quoted delimiters (Y2)`：`cat <<< 'meeting minutes'` 后的 `sort notes.tsv` 照常计入目标、`cat << 'EOF'`（空格+引号）正文不产生目标且后续 `sort real.tsv` 计入、`cat <<"END"` 无空格双引号同样剥离、正文 `rm -rf /` 不产生行为 |
+| Y3（转义字面 + 动态尾部） | `PathArg` 新增 `dynamic` 通道：前导转义字面（`\~`/`\$`/`"\$`）与含 `$`/反引号尾部混合时置 dynamic，`expandPathTarget` 直接返回 undefined → undeterminable，不再展开成错误绝对路径 | `escaped tilde plus variable tail stays undeterminable (Y3)`：`>\~$HOME/x`、`>\~$VAR`、`>\~/${HOME}` 均 undeterminable 且无伪造目标 |
+
+**复审修正 R7 后验证**：
+
+```
+$ bun run typecheck   # tsc --noEmit → clean
+$ bun test src
+ 260 pass
+ 0 fail
+Ran 260 tests across 14 files.
+$ bun run build       # dist/index.js 217.66 KB
+```
+
+**偏差**：无。
