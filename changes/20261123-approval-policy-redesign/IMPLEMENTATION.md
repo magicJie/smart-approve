@@ -433,3 +433,25 @@ $ bun run build       # dist/index.js 225.27 KB
 ```
 
 **偏差**：无。
+
+## 二十一、复审修正 R15（对应 REVIEW.md「第十五轮终审 · 1de8800」U1/U2）
+
+复审对象：`1de8800`。T1 已关闭；本轮 U1 必修 + U2（建议）交付。
+
+| 项 | 修正 | 断言 |
+|----|------|------|
+| U1（命令续行与引用型正文分开处理） | 撤销"整段先折叠再识别 heredoc"：预扫描回到按物理行识别 heredoc，正文行逐字消费、不参与命令词法状态；续行折叠改为只对**完成的命令工作项**执行 `collapseLineContinuations`，正文行末反斜杠不再与结束行拼接，正文引号不污染后续命令扫描 | `quoted heredoc bodies never leak lexical state into later commands (U1)` 三组 Bash 对照：① 引用正文撇号 + 后续单引号含 `\`+换行 的文件名保持 `a\\\nb`；② 正文末行字面 `\` 后正常闭合并登记 `note`、非未闭合；③ 正文含 `12"` + 注释尾 `\` 后 `note` 仍计入 |
+| U2（T1 回归用例强化） | 续行反斜杠不再计作段内内容（折叠后为空），续行放在开括号**之前**也能绑定同一命令段；新增对应用例捕获旧基线回归 | `continuation before the opening paren also binds the segment (U2)`：`\`+换行+`( cat <<EOF…` 与单行形式目标集/完整性一致且 `note` 保留 |
+
+**复审修正 R15 后验证**：
+
+```
+$ bun run typecheck   # tsc --noEmit → clean
+$ bun test src
+ 281 pass
+ 0 fail
+Ran 281 tests across 14 files.
+$ bun run build       # dist/index.js 225.35 KB
+```
+
+**偏差**：无。
