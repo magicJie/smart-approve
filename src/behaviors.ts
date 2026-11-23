@@ -661,8 +661,13 @@ function pathArg(rawToken: string | undefined): PathArg {
   const doubleQuoted = raw.length >= 2 && raw.startsWith("\"") && raw.endsWith("\"");
   const value = unquoteToken(raw);
   // Single quotes freeze everything; double quotes still allow $HOME but
-  // never tilde expansion — `"~"` is a literal name (R6).
-  const literal = singleQuoted || (doubleQuoted && /^~($|\/)/.test(value));
+  // never tilde expansion — `"~"` is a literal name (R6).  Backslash escapes
+  // carry the same literal semantics: a leading `\~` or `\$` (unquoted), or
+  // `"\$` inside double quotes, is an ordinary character the shell would
+  // never expand — the unescaped value must not be expanded either (W4).
+  // Only the LEADING position matters: `~/\~x` still expands its home prefix.
+  const escapedLiteral = /^\\[~$]/.test(raw) || /^"\\[$]/.test(raw);
+  const literal = singleQuoted || escapedLiteral || (doubleQuoted && /^~($|\/)/.test(value));
   return { value, literal };
 }
 

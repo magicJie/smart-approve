@@ -880,3 +880,31 @@ test("attached option values and input redirection are file targets", () => {
   // A redirection with no readable target cannot prove domain membership.
   assert.equal(commandFileTargets("cat < ", "/tmp").undeterminable, true);
 });
+
+test("escaped tilde and dollar literals match their quoted forms (W4)", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "smart-approve-esc-"));
+  try {
+    fs.writeFileSync(path.join(root, "~"), "x");
+    // \~ is the same literal filename as '~' and "~" — user tier, no block.
+    const escaped = analyzeBashOperation("chmod 777 \\~", root, root);
+    assert.ok(escaped.behaviors.includes("permission-change-user"), "\\~ must be user tier");
+    assert.equal(escaped.hardBlocked, false);
+    const quoted = analyzeBashOperation("chmod 777 '~'", root, root);
+    assert.deepEqual(escaped.behaviors, quoted.behaviors, "escaped and quoted tilde agree");
+    // The real home root stays hard-blocked.
+    const bare = analyzeBashOperation("chmod 777 ~", root, root);
+    assert.equal(bare.hardBlocked, true);
+    // Escaped $HOME behaves like the single-quoted literal.
+    const redirEsc = commandFileTargets("echo hi >\\$HOME/out", root);
+    assert.deepEqual(redirEsc.targets.map((t) => t.value), ["$HOME/out"]);
+    const redirDq = commandFileTargets('echo hi >"\\$HOME/out"', root);
+    assert.deepEqual(redirDq.targets.map((t) => t.value), ["$HOME/out"]);
+    const redirQ = commandFileTargets("echo hi >'$HOME/out'", root);
+    assert.deepEqual(redirEsc.targets, redirQ.targets, "escaped and quoted $HOME agree");
+    // Only the leading position is literal: ~/... still expands home.
+    const redirHome = commandFileTargets("echo hi >~/out", root);
+    assert.notDeepEqual(redirHome.targets.map((t) => t.value), ["~/out"]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
