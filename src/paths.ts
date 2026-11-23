@@ -236,6 +236,43 @@ export interface CommandInvocation {
   rawArgs: string[];
 }
 
+/** Evaluate a complete shell word: quoted and unquoted fragments
+ *  concatenate (`"2026".log` → `2026.log`), backslash escapes outside quotes
+ *  unescape, double quotes unescape only `$`, `"`, `\\`, backtick.  Unlike
+ *  unquoteToken (which only unwraps fully-quoted tokens), this handles mixed
+ *  fragments — used for path operands where the evaluated value is the real
+ *  filename (Y1). */
+export function evaluateShellWord(raw: string): string {
+  let out = "";
+  let i = 0;
+  while (i < raw.length) {
+    const c = raw[i];
+    if (c === "'") {
+      i++;
+      while (i < raw.length && raw[i] !== "'") out += raw[i++];
+      i++; // closing quote
+    } else if (c === '"') {
+      i++;
+      while (i < raw.length && raw[i] !== '"') {
+        if (raw[i] === "\\" && i + 1 < raw.length && /["\\$`]/.test(raw[i + 1])) {
+          out += raw[i + 1];
+          i += 2;
+        } else {
+          out += raw[i++];
+        }
+      }
+      i++; // closing quote
+    } else if (c === "\\" && i + 1 < raw.length) {
+      out += raw[i + 1];
+      i += 2;
+    } else {
+      out += c;
+      i++;
+    }
+  }
+  return out;
+}
+
 export function unquoteToken(token: string): string {
   if (
     token.length >= 2 &&

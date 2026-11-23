@@ -968,10 +968,11 @@ test("fd duplication is decided on the whole word, not the first char (X1)", () 
     commandFileTargets("echo hi >&2026.log", "/tmp").targets.map((t) => t.value),
     ["2026.log"],
   );
-  assert.deepEqual(
-    commandFileTargets("echo hi 2>&2026.log", "/tmp").targets.map((t) => t.value),
-    ["2026.log"],
-  );
+  // Y1: an explicit left fd + a non-fd word is bash "ambiguous redirect" —
+  // undeterminable, not a fabricated file target.
+  const ambiguous = commandFileTargets("echo hi 2>&2026.log", "/tmp");
+  assert.equal(ambiguous.undeterminable, true);
+  assert.deepEqual(ambiguous.targets, []);
   // Pure digits stay fd duplications.
   assert.deepEqual(commandFileTargets("echo hi >&2", "/tmp").targets, []);
   assert.deepEqual(commandFileTargets("echo hi 2>&1", "/tmp").targets, []);
@@ -1034,5 +1035,60 @@ test("tilde mixed with variable in one operand is undeterminable (X5)", () => {
   for (const form of [">\\~$HOME/x", ">\\~/$VAR", ">~$VAR"]) {
     const r = commandFileTargets(`echo hi ${form}`, "/tmp");
     assert.equal(r.undeterminable, true, `${form} must not resolve to a wrong absolute path`);
+  }
+});
+
+test("redirect operands are judged by evaluated word value + left fd (Y1)", () => {
+  // Partially/fully quoted spellings produce the SAME target set as bare.
+  for (const form of ['>"2026".log', '>"2026.log"', ">2026.log"]) {
+    assert.deepEqual(
+      commandFileTargets(`echo hi ${form}`, "/tmp").targets.map((t) => t.value),
+      ["2026.log"],
+      form,
+    );
+  }
+  // A quoted fd descriptor is still an fd duplication in bash.
+  assert.deepEqual(commandFileTargets('echo hi >&"2"', "/tmp").targets, []);
+  assert.deepEqual(commandFileTargets("echo hi >&'1'", "/tmp").targets, []);
+  // Explicit left fd + non-fd word → ambiguous redirect, undeterminable.
+  assert.equal(commandFileTargets("echo hi 2>&2026.log", "/tmp").undeterminable, true);
+  assert.equal(commandFileTargets('echo hi 2>&"out.log"', "/tmp").undeterminable, true);
+  // Without a left fd the same word is a legitimate file write.
+  assert.deepEqual(
+    commandFileTargets("echo hi >&2026.log", "/tmp").targets.map((t) => t.value),
+    ["2026.log"],
+  );
+});
+
+test("here-strings queue no body; heredocs allow spaced/quoted delimiters (Y2)", () => {
+  // `<<<` has no closing word — the next command line is NOT swallowed.
+  const hs = commandFileTargets(
+    "cat <<< 'meeting minutes'\nsort notes.tsv\n",
+    "/tmp",
+  );
+  assert.deepEqual(hs.targets.map((t) => t.value), ["notes.tsv"],
+    "the command after a here-string must still be analyzed");
+  // Spaced + quoted heredoc delimiter: body text is data, next line analyzed.
+  const hd = commandFileTargets(
+    "cat << 'EOF'\ncat secret.txt\nEOF\nsort real.tsv\n",
+    "/tmp",
+  );
+  assert.deepEqual(hd.targets.map((t) => t.value), ["real.tsv"]);
+  assert.equal(hd.undeterminable, false);
+  // Double-quoted delimiter with no space also works.
+  const hd2 = commandFileTargets(
+    'cat <<"END"\nrm -rf /\nEND\n',
+    "/tmp",
+  );
+  assert.deepEqual(hd2.targets, []);
+  const body = analyzeCommand("cat << 'EOF'\nrm -rf /\nEOF\n");
+  assert.ok(!body.behaviors.includes("delete-root"));
+});
+
+test("escaped tilde plus variable tail stays undeterminable (Y3)", () => {
+  for (const form of [">\\~$HOME/x", ">\\~$VAR", ">\\~/${HOME}"]) {
+    const r = commandFileTargets(`echo hi ${form}`, "/tmp");
+    assert.equal(r.undeterminable, true, form);
+    assert.deepEqual(r.targets, [], `${form} must not yield a fabricated path`);
   }
 });

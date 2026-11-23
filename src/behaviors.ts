@@ -15,6 +15,7 @@ import {
   resolveFilesystemPathCandidates,
   roughTokenize,
   expandHomeLiteral,
+  evaluateShellWord,
   semanticPathCandidates,
   unquoteToken,
   type CommandInvocation,
@@ -584,30 +585,54 @@ function redirectionTargets(
       cursor++;
       write = true;
     }
+    // An explicit fd prefix is digits directly before the operator, standing
+    // alone (start/whitespace before them) — `2>&x` vs a filename ending in
+    // digits (`foo2>x` is NOT an fd prefix).
+    let fdStart = index;
+    while (fdStart > 0 && /\d/.test(segment[fdStart - 1])) fdStart--;
+    const leftFd = fdStart < index &&
+      (fdStart === 0 || /[\s;|&(]/.test(segment[fdStart - 1]));
     const dupMarker = segment[cursor] === "&";
     if (dupMarker) cursor++;
     while (/\s/.test(segment[cursor] ?? "")) cursor++;
 
+    // Read the COMPLETE shell word — quoted and unquoted fragments
+    // concatenate (`>"2026".log` ≡ `>2026.log`), so the operand's value is
+    // judged as a whole, never a raw prefix (Y1).
     const start = cursor;
-    const targetQuote = segment[cursor];
-    if (targetQuote === "'" || targetQuote === "\"") {
-      cursor++;
-      while (cursor < segment.length && segment[cursor] !== targetQuote) {
-        if (segment[cursor] === "\\" && targetQuote === "\"" && cursor + 1 < segment.length) cursor++;
+    while (cursor < segment.length) {
+      const c = segment[cursor];
+      if (c === "'" || c === "\"") {
+        const q = c;
         cursor++;
-      }
-      if (segment[cursor] === targetQuote) cursor++;
-    } else {
-      while (cursor < segment.length && !/[\s;&|()<>\n]/.test(segment[cursor])) {
+        while (cursor < segment.length && segment[cursor] !== q) {
+          if (segment[cursor] === "\\" && q === "\"" && cursor + 1 < segment.length) cursor++;
+          cursor++;
+        }
+        if (segment[cursor] === q) cursor++;
+      } else if (/[\s;&|()<>\n]/.test(c)) {
+        break;
+      } else if (c === "\\" && cursor + 1 < segment.length) {
+        cursor += 2; // escaped char (incl. space) belongs to this word
+      } else {
         cursor++;
       }
     }
     const target = segment.slice(start, cursor);
+    const wordValue = evaluateShellWord(target);
     if (dupMarker) {
-      // `n>&word` / `n<&word`: an fd duplication only when the WHOLE word is
-      // digits or a lone `-`; anything else (`>&2026.log`, `>&file`) is
-      // bash's combined-stdout file write (X1).
-      if (target === "-" || /^\d+$/.test(target)) {
+      // Judge by the evaluated word + the left fd, not the raw fragment (Y1):
+      //  - `>&2` / `>&"2"` (no left fd): a pure-digit/- word is an fd dup.
+      //  - `2>&2026.log` (left fd + non-fd word): bash "ambiguous redirect" —
+      //    an invalid form, undeterminable, NOT a fabricated file target.
+      //  - `>&file` (no left fd, non-fd word): bash combined-stdout write.
+      const isFdWord = wordValue === "-" || /^\d+$/.test(wordValue);
+      if (leftFd) {
+        if (!isFdWord) incomplete = true; // ambiguous redirect
+        index = cursor - 1;
+        continue;
+      }
+      if (isFdWord) {
         index = cursor - 1;
         continue;
       }
@@ -683,13 +708,17 @@ interface PathArg {
   value: string;
   /** True when the token was fully single-quoted (literal `$HOME`, `~`). */
   literal: boolean;
+  /** True when the word mixes an escaped literal char with a dynamic tail
+   *  (`\~$HOME/x`) — no faithful expansion exists; treat as undeterminable
+   *  instead of fabricating an absolute path (Y3). */
+  dynamic?: boolean;
 }
 
 function pathArg(rawToken: string | undefined): PathArg {
   const raw = rawToken ?? "";
   const singleQuoted = raw.length >= 2 && raw.startsWith("'") && raw.endsWith("'");
   const doubleQuoted = raw.length >= 2 && raw.startsWith("\"") && raw.endsWith("\"");
-  const value = unquoteToken(raw);
+  const value = evaluateShellWord(raw);
   // Single quotes freeze everything; double quotes still allow $HOME but
   // never tilde expansion — `"~"` is a literal name (R6).  Backslash escapes
   // carry the same literal semantics: a leading `\~` or `\$` (unquoted), or
@@ -701,8 +730,11 @@ function pathArg(rawToken: string | undefined): PathArg {
   // `\~$VAR` must come back undeterminable, not a file literally named
   // `~$VAR`.
   const dynamicRemainder = /[$`]/.test(value.slice(1));
-  const escapedLiteral = (/^\\[~$]/.test(raw) || /^"\\[$]/.test(raw)) && !dynamicRemainder;
-  const literal = singleQuoted || escapedLiteral || (doubleQuoted && /^~($|\/)/.test(value));
+  const escapedLead = /^\\[~$]/.test(raw) || /^"\\[$]/.test(raw);
+  // Escaped literal lead + dynamic tail: no single expansion is faithful →
+  // undeterminable, never an expanded-then-wrong absolute path (Y3).
+  if (escapedLead && dynamicRemainder) return { value, literal: false, dynamic: true };
+  const literal = singleQuoted || escapedLead || (doubleQuoted && /^~($|\/)/.test(value));
   return { value, literal };
 }
 
@@ -722,12 +754,18 @@ function stripHeredocBodies(command: string): string {
       continue; // body line (or the closing delimiter) — never a command
     }
     out.push(line);
-    // Parse this line's `<<` operators left to right; each one's delimiter
-    // ends the body that starts on the NEXT line.
-    for (const match of line.matchAll(/<<(-?)(?:"([^"]*)"|'([^']*)'|(\S+))/g)) {
+    // Parse this line's operators left to right (Y2):
+    //  - `<<<` is a here-string: NO closing word, NO body lines — the next
+    //    real command line is still a command, not heredoc text.
+    //  - `<<`/`<<-` is a heredoc: its delimiter (which may be quoted and may
+    //    follow whitespace) ends the body that starts on the NEXT line.
+    for (const match of line.matchAll(
+      /(<<<)|(<<)(-?)[ \t]*(?:"([^"]*)"|'([^']*)'|(\S+))/g,
+    )) {
+      if (match[1]) continue; // here-string — nothing to queue
       delimiters.push({
-        word: match[2] ?? match[3] ?? match[4] ?? "",
-        dash: match[1] === "-",
+        word: match[4] ?? match[5] ?? match[6] ?? "",
+        dash: match[3] === "-",
       });
     }
   }
@@ -996,6 +1034,7 @@ function permissionChangeTier(
 /** Expand a PathArg: literal (single-quoted) values pass through untouched;
  *  unquoted values get the static HOME/tilde expansion (R6). */
 function expandPathTarget(target: PathArg, home: string): string | undefined {
+  if (target.dynamic) return undefined; // Y3: no faithful expansion
   if (target.literal) return target.value === "" ? undefined : target.value;
   return expandHomeLiteral(target.value, home);
 }
