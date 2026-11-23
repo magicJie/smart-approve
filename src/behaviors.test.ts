@@ -862,3 +862,21 @@ test("literal tilde and HOME quoting are honored end to end", () => {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("attached option values and input redirection are file targets", () => {
+  // `-oout` is GNU-cluster for `-o out` — both spellings yield equal targets.
+  const spaced = commandFileTargets("sort -o out.tsv in.tsv", "/tmp");
+  const attached = commandFileTargets("sort -oout.tsv in.tsv", "/tmp");
+  assert.deepEqual(attached.targets, spaced.targets);
+  assert.equal(attached.undeterminable, false);
+
+  // Input redirection counts as a filesystem target too.
+  const input = commandFileTargets("sort < in.tsv", "/tmp");
+  assert.deepEqual(input.targets.map((t) => t.value), ["in.tsv"]);
+  assert.equal(input.undeterminable, false);
+  // Heredocs and fd duplications are not file targets.
+  assert.equal(commandFileTargets("cat <<EOF", "/tmp").undeterminable, false);
+  assert.equal(commandFileTargets("cat <&3", "/tmp").undeterminable, false);
+  // A redirection with no readable target cannot prove domain membership.
+  assert.equal(commandFileTargets("cat < ", "/tmp").undeterminable, true);
+});

@@ -18,7 +18,7 @@ import type {
 import { Logger } from "./logger";
 import { detectLang, getI18n, makeLabel } from "./i18n";
 import type { Lang } from "./i18n";
-import { ProtectedPathMatcher, resolveFilesystemPathCandidates } from "./paths";
+import { ProtectedPathMatcher, resolveFilesystemPathCandidates, semanticPathCandidates } from "./paths";
 import { ConfigStore } from "./config";
 import { AllowList } from "./allowlist";
 import { SessionContextGatherer } from "./context";
@@ -82,7 +82,7 @@ function collectProtectedTargets(event: ToolCallEvent): string[] {
 }
 
 function isHardBlockedFileTarget(target: string, cwd: string): boolean {
-  return resolveFilesystemPathCandidates(target, cwd).some((candidate) =>
+  return semanticPathCandidates(target, cwd).some((candidate) =>
     /^(?:\/private)?\/etc\/(?:passwd|shadow|sudoers|hosts)(?:$|[./])/i.test(candidate) ||
     /^\/dev\/(?:sd[a-z]\d*|nvme\d+(?:n\d+)?(?:p\d+)?|disk\d+(?:s\d+)?|hd[a-z]\d*|vd[a-z]\d*|xvd[a-z]\d*|mmcblk\d+(?:p\d+)?|mapper\/[^/]+|md\d+|sg\d+|st\d+|nst\d+)$/i.test(candidate)
   );

@@ -14,6 +14,7 @@ import {
   isAssignment,
   resolveFilesystemPathCandidates,
   roughTokenize,
+  expandHomeLiteral,
   semanticPathCandidates,
   unquoteToken,
   type CommandInvocation,
@@ -526,10 +527,17 @@ function hasSensitiveAccountFileReference(name: string, args: string[]): boolean
 
 
 
-/** Raw redirection targets per stage — the token is returned verbatim
- *  (quotes intact) so the caller can honor literal quoting via pathArg (R6). */
-function redirectionTargets(segment: string): string[] {
+/** Raw redirection targets per stage — input (`<`) and output (`>`) targets
+ *  alike; the token is returned verbatim (quotes intact) so the caller can
+ *  honor literal quoting via pathArg (R6).  `incomplete` is set when a
+ *  redirection operator has no recognizable target — heredocs/here-strings
+ *  and fd duplications (`<<`, `<<<`, `>&`, `<&`) have no filesystem target
+ *  and do not set it. */
+function redirectionTargets(
+  segment: string,
+): { targets: string[]; incomplete: boolean } {
   const targets: string[] = [];
+  let incomplete = false;
   let quote: string | undefined;
   let escaped = false;
 
@@ -549,12 +557,18 @@ function redirectionTargets(segment: string): string[] {
       quote = ch;
       continue;
     }
-    if (ch !== ">") continue;
+    if (ch !== ">" && ch !== "<") continue;
 
     let cursor = index + 1;
-    if (segment[cursor] === ">") cursor++;
+    if (segment[cursor] === ch) cursor++; // `>>` / `<<` — heredoc handled below
+    if (ch === "<" && segment[cursor] === "<") cursor++; // `<<<` here-string
+    const isHeredoc = ch === "<" && cursor - index >= 2;
+    const isDup = segment[cursor] === "&";
+    const isRW = ch === "<" && segment[cursor] === ">" && cursor === index + 1;
+    if (isRW) cursor++;
+    if (segment[cursor] === "|") continue;
+    if (isHeredoc || isDup) continue; // delimiter word / fd — no path target
     while (/\s/.test(segment[cursor] ?? "")) cursor++;
-    if (segment[cursor] === "&" || segment[cursor] === "|") continue;
 
     const start = cursor;
     const targetQuote = segment[cursor];
@@ -572,9 +586,10 @@ function redirectionTargets(segment: string): string[] {
     }
     const target = segment.slice(start, cursor);
     if (target) targets.push(target);
+    else incomplete = true;
     index = cursor - 1;
   }
-  return targets;
+  return { targets, incomplete };
 }
 
 function hasInterpreterExecutionFlag(args: string[]): boolean {
@@ -675,6 +690,8 @@ function commandGroups(command: string): string[] {
       continue;
     }
     if (ch === "&") {
+      // `>&` / `<&` fd duplications are redirection syntax — not separators.
+      if (command[i - 1] === ">" || command[i - 1] === "<") continue;
       const segment = command.slice(start, i).trim();
       if (segment) result.push(segment);
       if (command[i + 1] === "&") i++;
@@ -787,21 +804,6 @@ function pipeStageProgram(segment: string): string | undefined {
   return invocation.name;
 }
 
-/** Expand the HOME forms resolvable without running the shell (~, $HOME,
- *  ${HOME}).  Any other $/`/glob/`~user` form is dynamic → undefined. */
-function expandHomeLiteral(value: string, home: string): string | undefined {
-  let expanded = value;
-  if (!expanded) return undefined;
-  if (expanded === "~") expanded = home;
-  else if (expanded.startsWith("~/")) expanded = path.join(home, expanded.slice(2));
-  else if (expanded.startsWith("~")) return undefined; // ~user needs a lookup
-  const placeholder = "\0HOME\0";
-  expanded = expanded
-    .replace(/\$\{HOME\}/g, placeholder)
-    .replace(/\$HOME(?![A-Za-z0-9_])/g, placeholder);
-  if (/[$`{}\[\]*?]/.test(expanded)) return undefined;
-  return expanded.split(placeholder).join(home) || undefined;
-}
 
 function isSystemTarget(value: string): boolean {
   return value === "/" || PERMISSION_SYSTEM_PATH_RE.test(value);
@@ -1012,6 +1014,9 @@ function stagePathArgs(
       i++;
       continue;
     }
+    // Redirection operators (`<`, `>`, `2>`-prefixed, `<>`, `>&fd`) are
+    // syntax, not operands; the target itself is counted separately.
+    if (/^\d*[<>]/.test(arg)) { i++; continue; }
     operands.push(pathArg(raw));
     i++;
   }
@@ -1048,6 +1053,16 @@ function stageFileOptionTargets(
       continue;
     }
     if (nonfileOpts?.has(arg)) { i += 2; continue; }
+    // Attached short-option value: `-oout` ≡ `-o out` (GNU cluster form).
+    if (arg.length > 2 && !arg.startsWith("--")) {
+      const opt = arg.slice(0, 2);
+      if (fileOpts?.has(opt)) {
+        targets.push(pathArg(rawArgs[i].slice(2)));
+        i++;
+        continue;
+      }
+      if (nonfileOpts?.has(opt)) { i++; continue; }
+    }
     i++;
   }
   return { targets, complete };
@@ -1237,7 +1252,9 @@ export function commandFileTargets(
 
         // Redirection targets are filesystem targets too (R2); /dev/null
         // is the universal sink and carries no domain risk.
-        for (const raw of redirectionTargets(stage)) {
+        const redirect = redirectionTargets(stage);
+        if (redirect.incomplete) undeterminable = true;
+        for (const raw of redirect.targets) {
           const expanded = expandPathTarget(pathArg(raw), home);
           if (expanded === undefined) {
             undeterminable = true;
@@ -1249,7 +1266,14 @@ export function commandFileTargets(
       }
     }
   }
-  return { targets, undeterminable };
+  const seen = new Set<string>();
+  const unique = targets.filter((t) => {
+    const key = `${t.cwd}${t.value}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+  return { targets: unique, undeterminable };
 }
 
 
@@ -1715,7 +1739,7 @@ export function analyzeCommand(cmd: string): DangerAnalysis {
         behaviorSet.add("kubectl-delete");
       }
 
-      for (const rawTarget of redirectionTargets(segment)) {
+      for (const rawTarget of redirectionTargets(segment).targets) {
         const target = unquoteToken(rawTarget);
         const normalized = target.replace(/\\/g, "/");
         const sensitiveSystemWrite =

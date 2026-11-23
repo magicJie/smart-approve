@@ -9,9 +9,10 @@
 
 import * as fs from "node:fs";
 import * as path from "node:path";
+import * as os from "node:os";
 import type { AllowEntry } from "./types";
 import { normalize, commandFileTargets } from "./behaviors";
-import { matchCommandGlob, resolveFilesystemPathCandidates, semanticPathCandidates } from "./paths";
+import { matchCommandGlob, expandHomeLiteral, resolveFilesystemPathCandidates, semanticPathCandidates } from "./paths";
 import type { Logger } from "./logger";
 
 /** Normalize a key for dedup: tool + normalized-content + cwd. */
@@ -101,7 +102,11 @@ export class AllowList {
     cwd: string,
     analysisCwd: string,
   ): boolean {
-    const domain = semanticPathCandidates(entry.domain ?? "", entry.cwd);
+    // The configured domain root is expanded once (~/, $HOME), then walked
+    // with realpath semantics — the raw string never becomes a candidate
+    // (W3). Command targets arrive already expanded at the quoting boundary.
+    const domainRoot = expandHomeLiteral(entry.domain ?? "", process.env.HOME || os.homedir()) ?? "";
+    const domain = semanticPathCandidates(domainRoot, entry.cwd, { expandHome: false });
     const withinDomain = (candidate: string): boolean =>
       domain.some((directory) =>
         candidate === directory ||
@@ -119,7 +124,12 @@ export class AllowList {
       // operates on a single path (write/edit tools) — not for tools whose
       // subject is source code or free text (eval, notebook cells), which
       if (!looksLikeSinglePath(content)) return false;
-      return resolvesInside(path.resolve(cwd, content), cwd);
+      // Raw path + cwd go straight to the shared realpath-ordered resolver —
+      // a lexical path.resolve here would fold `..` before symlink resolution
+      // (W3). Tool-supplied paths may use ~/ — expand at this boundary.
+      const expandedSubject = expandHomeLiteral(content, process.env.HOME || os.homedir());
+      if (expandedSubject === undefined) return false; // dynamic value — normal approval
+      return resolvesInside(expandedSubject, cwd);
     }
 
     const { targets, undeterminable } = commandFileTargets(content, analysisCwd);

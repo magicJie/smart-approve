@@ -114,7 +114,7 @@ export function matchCommandGlob(pattern: string, value: string): boolean {
     .filter((invocation): invocation is CommandInvocation => invocation !== undefined);
 
   const matches = (invocation: CommandInvocation): boolean => {
-    const program = [invocation.name, ...invocation.args];
+    const program = [invocation.program, ...invocation.args];
     if (program.length !== argGlobs.length) return false;
     return argGlobs.every((re, i) => re!.test(program[i]));
   };
@@ -182,6 +182,8 @@ function splitCommandSegments(value: string): string[] {
       continue;
     }
     if (ch === "&" || (ch === "|")) {
+      // `>&` / `<&` fd duplications are redirection syntax — not separators.
+      if (ch === "&" && (value[i - 1] === ">" || value[i - 1] === "<")) continue;
       const segment = value.slice(start, i).trim();
       if (segment) result.push(segment);
       if (value[i + 1] === ch) i++;
@@ -219,6 +221,10 @@ export function isUserWritablePath(
 // ── Shell tokenization (shared with behavior analysis and allow-list globs) ─
 
 export interface CommandInvocation {
+  /** Program token as invoked — path and case preserved (`/usr/bin/sort`,
+   *  `CURL`).  `name` is the lowercased basename used for classification;
+   *  authorization globs match on `program` (W1). */
+  program: string;
   name: string;
   args: string[];
   /** Raw token text per arg: `'…'`-quoted operands are literal and must not
@@ -355,6 +361,7 @@ export function commandAndArgs(
       continue;
     }
     return {
+      program: unquoteToken(tokens[index]),
       name,
       args: tokens.slice(index + 1).map(unquoteToken),
       rawArgs: tokens.slice(index + 1),
@@ -362,6 +369,22 @@ export function commandAndArgs(
   }
 
   return undefined;
+}
+
+/** Expand the HOME forms resolvable without running the shell (~, $HOME,
+ *  ${HOME}).  Any other $/`/glob/`~user` form is dynamic → undefined. */
+export function expandHomeLiteral(value: string, home: string): string | undefined {
+  let expanded = value;
+  if (!expanded) return undefined;
+  if (expanded === "~") expanded = home;
+  else if (expanded.startsWith("~/")) expanded = path.join(home, expanded.slice(2));
+  else if (expanded.startsWith("~")) return undefined; // ~user needs a lookup
+  const placeholder = "\0HOME\0";
+  expanded = expanded
+    .replace(/\$\{HOME\}/g, placeholder)
+    .replace(/\$HOME(?![A-Za-z0-9_])/g, placeholder);
+  if (/[$`{}\[\]*?]/.test(expanded)) return undefined;
+  return expanded.split(placeholder).join(home) || undefined;
 }
 
 /** Resolve a local path and its symlinked ancestors, including missing write targets.
@@ -415,8 +438,17 @@ export function semanticPathCandidates(
   options: { expandHome?: boolean } = {},
 ): string[] {
   const lexical = resolveFilesystemPathCandidates(target, baseCwd, options);
-  if (!path.isAbsolute(target) && !path.isAbsolute(baseCwd)) return lexical;
-  const absolute = path.isAbsolute(target) ? target : `${baseCwd}/${target}`;
+  // The semantic walk must see the same expanded string the lexical pass
+  // resolved — a raw `~`/`$HOME` prefix would otherwise produce a spurious
+  // `cwd/~/…` candidate (W3).
+  const home = process.env.HOME || os.homedir();
+  const expandHome = options.expandHome !== false;
+  const expandedTarget = !expandHome ? target
+    : target === "~" ? home
+    : target.startsWith("~/") ? path.join(home, target.slice(2))
+    : target;
+  if (!path.isAbsolute(expandedTarget) && !path.isAbsolute(baseCwd)) return lexical;
+  const absolute = path.isAbsolute(expandedTarget) ? expandedTarget : `${baseCwd}/${expandedTarget}`;
   // Original components (pre-`..` folding) so a `..` right after a symlinked
   // directory escapes the link target — realpath semantics (R3).
   const parts = absolute.split("/").filter((part) => part !== "" && part !== ".");
@@ -463,7 +495,9 @@ export class ProtectedPathMatcher {
   isProtected(filePath: string, baseCwd = process.cwd()): boolean {
     if (!filePath || this.patterns.length === 0) return false;
 
-    for (const candidate of resolveFilesystemPathCandidates(filePath, baseCwd)) {
+    // realpath-ordered resolution — a `..` right after a symlinked
+    // directory must escape the link target before the pattern match (W3).
+    for (const candidate of semanticPathCandidates(filePath, baseCwd)) {
       const normalized = candidate.replace(/\\/g, "/");
       const basename = path.basename(candidate);
 

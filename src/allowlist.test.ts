@@ -359,3 +359,70 @@ test("command globs tokenize arguments — quoted and escaped space filenames ma
   assert.equal(neg.isAllowed("bash", "cat a; ls", CWD), false);
   assert.equal(neg.isAllowed("bash", "ls -la", CWD), true);
 });
+
+test("command globs distinguish full paths from same-name programs", () => {
+  const { list } = makeList([
+    { tool: "bash", key: "x", cwd: CWD, timestamp: "t", pattern: "/usr/bin/sort" },
+  ]);
+  const { list: neg } = makeList([
+    { tool: "bash", key: "x", cwd: CWD, timestamp: "t", pattern: "!/usr/bin/sort ** ** **" },
+  ]);
+  try {
+    // The rule names the full path — only that program matches.
+    assert.equal(list.isAllowed("bash", "/usr/bin/sort", CWD), true);
+    assert.equal(list.isAllowed("bash", "sort", CWD), false, "bare sort is a different program");
+    assert.equal(list.isAllowed("bash", "/opt/bin/sort", CWD), false, "other-dir sort differs");
+    // Negation: /usr/bin/sort is rejected while bare sort is untouched.
+    assert.equal(neg.isAllowed("bash", "/usr/bin/sort -o out in", CWD), false);
+    assert.equal(neg.isAllowed("bash", "sort -o out in", CWD), true);
+    assert.equal(neg.isAllowed("bash", "ls -la", CWD), true);
+  } finally {
+    // makeList dirs are temp files — no explicit cleanup needed per existing tests
+  }
+});
+
+test("domain entries cover input redirection and attached output spellings", () => {
+  const dir = "/home/jay/projects";
+  const { list } = makeList([
+    { tool: "bash", key: "sort", cwd: dir, timestamp: "t", domain: dir },
+  ]);
+  try {
+    assert.equal(list.isAllowed("bash", "sort -oout.tsv in.tsv", dir), true);
+    assert.equal(list.isAllowed("bash", "sort < /etc/passwd", dir), false,
+      "input redirect outside domain");
+    assert.equal(list.isAllowed("bash", "sort -o/etc/x in.tsv", dir), false,
+      "attached output outside domain");
+    assert.equal(list.isAllowed("bash", "sort -o out.tsv < /etc/passwd", dir), false,
+      "spelled-out option + outside input both defeat");
+  } finally {}
+});
+
+test("write/edit domain targets resolve .. through symlinks (no early path.resolve)", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "smart-approve-wdom-"));
+  const domain = path.join(root, "a");
+  try {
+    fs.mkdirSync(domain);
+    fs.writeFileSync(path.join(domain, "note"), "A");
+    fs.writeFileSync(path.join(root, "note"), "B");
+    fs.symlinkSync("/etc", path.join(domain, "l"));
+    const { list } = makeList([
+      { tool: "write", key: "__domain-only__", cwd: domain, timestamp: "t", domain },
+    ]);
+    // Raw path goes to the shared resolver: l → /etc, .. → /, so the write
+    // lands on /note — outside the domain despite the lexical fold.
+    assert.equal(list.isAllowed("write", "l/../note", domain), false,
+      "write tool must not pre-fold .. lexically");
+    // An ordinary in-domain file is unaffected.
+    assert.equal(list.isAllowed("write", "note", domain), true);
+    // A configured ~/ domain root expands exactly once.
+    const { list: home } = makeList([
+      { tool: "write", key: "__domain-only__", cwd: domain, timestamp: "t", domain: "~" },
+    ]);
+    assert.equal(home.isAllowed("write", `${os.homedir()}/note`, domain), true,
+      "~ domain root resolves to the home directory");
+    assert.equal(home.isAllowed("write", "/etc/passwd", domain), false,
+      "an out-of-home absolute target is outside the ~ domain");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
