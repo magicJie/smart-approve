@@ -536,3 +536,26 @@ $ bun run build       # dist/index.js 226.17 KB
 ```
 
 **偏差**：无。
+
+## 二十六、Codex 对照语料回归基线（test/corpus/）
+
+19 轮终审中，codex 的「临时目录 Bash 对照」此前只在 REVIEW.md 里以文字描述；src/*.test.ts 只断言候选行为，不跑真实 bash。本轮把可自动判定的对照固化为**执行真实 bash 的回归基线**：`test/corpus/bash-corpus.test.ts`，47 个用例，每条以 `corpus R<轮>-<项>` 命名并注明来源轮次。
+
+**对照方法**：每个用例在 `mkdtemp` 临时目录里造好临时文件布局（含 `sub/` 子目录、含空格/换行/前导 `-` 的文件名），用 `spawnSync("bash", ["--norc"], { input: script, cwd: dir })` 真实执行脚本；ground truth 取自**可观察副作用**——文件内容标记 `MARK_<name>` 出现在 stdout（bash 确实读到了该文件）、文件是否落盘（bash 确实写出了该文件）、stderr 是否含 `delimited by end-of-file`（未闭合警告）。再断言 `commandFileTargets` 的文件清单与 `undeterminable`、`analyzeBashOperation` 的行为标签与 `requiresConfirmation` 与之一致。凡 bash 不宜真实执行的（`curl|sh` 联网、`chmod ~` 真实 home 根），ground truth 用 REVIEW 记录的 bash 语义，仅断言插件侧，并在注释中说明。
+
+**覆盖轮次**：R4-W4（字面 `~`）、R5-V1/V5（`&>` 合并写、`sort -ro` 连写、未知 cluster、转义+动态尾部）、R6-X1/X2/X3/X4（`report=1.tsv`、`|&` 相邻管线、前导 `-` 文件名、字面正文不是命令）、R7-Y1/Y2（引号重定向同目标、`>&"2"` 无目标、`2>&file` ambiguous、here-string/空白+引号分隔词）、R8-Z1（引号/注释中的 heredoc 标记）、R9-Z1a/Z1c（`<<'E\OF'` 字面分隔词、`<&file` 无效、`01>&file`）、R10-Q1/Q3（撇号不吞替换、`\EOF` 与 `'E'OF` 引用分隔词）、R11-Q1/N1（子 shell cwd、声明行 cd 不回溯、`<<''` 空行结束）、R12-R1/R2/N1（`cd &&` 同行展开、动态 cd undeterminable、末尾换行≠空行）、R13-S1/S2（括号分组展开 cwd、跨行引号文件名）、R14-T1/T2（开括号前续行、注释尾反斜杠、成对反斜杠、双引号撇号续行）、R15-U1/U2（引用正文三组对照）、R16-K1/K2（声明续行操作数、正文拼接≠分隔词）、R17-M1（拼接=分隔词/偶数反斜杠/引用正文）、R18-P1（EOF 待续行：读文件、本地计算、子目录）、R19（首末行替换、排队引用状态）。
+
+**未重复**：仅断言候选行为、无真实 bash 对照价值的用例保留在 `src/behaviors.test.ts`（285 条），语料不复制；域检查/allowlist 的 symlink-realpath 对照不涉及 bash 执行语义，不在本语料范围。
+
+**版本分歧**：`01>&file.txt`（R9-Z1c）在基线 bash 5.2.37 合法、bash ≥5.3 报 ambiguous redirect，该用例按测试进程实际调用的 bash 版本在注册时 `test.skip`；本机为 bash 5.2.37（与 codex 基线同版），47 条全部真实执行。`cd "$SUB"`（R12-R2）标注为安全分歧：bash 实际读 `$HOME/note`，插件保守报 undeterminable。
+
+**运行方式**：
+
+```
+$ bun test                              # 全量：src 285 + corpus 47 = 332
+$ bun test test/corpus/bash-corpus.test.ts   # 仅语料，47 条
+$ bun run typecheck                     # tsconfig include 已加 test/**/*.ts
+$ bun run build                         # dist/index.js 226.17 KB（无 src 改动）
+```
+
+**验证结果**（本机 bash 5.2.37，与 codex 基线同版；非交互 `bash --norc` 读 stdin）：`bun test` 332 pass / 0 fail，15 个文件；typecheck 退出 0；build 226.17 KB 与上轮一致。改动文件：新增 `test/corpus/bash-corpus.test.ts`，`package.json` 的 `test` 脚本由 `bun test src` 改为 `bun test`，`tsconfig.json` include 追加 `test/**/*.ts`，本报告追加本节。无 `src/` 代码改动。
