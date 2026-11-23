@@ -10,15 +10,15 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AllowEntry } from "./types";
-import { normalize } from "./behaviors";
-import { matchGlob, resolveFilesystemPathCandidates } from "./paths";
+import { normalize, commandFileTargets } from "./behaviors";
+import { matchCommandGlob, resolveFilesystemPathCandidates } from "./paths";
 import type { Logger } from "./logger";
 
 /** Normalize a key for dedup: tool + normalized-content + cwd. */
 function makeAllowKey(tool: string, content: string, cwd: string): string {
   const normalized = tool === "bash"
     ? normalize(content)
-    : path.resolve(content);
+    : path.resolve(cwd, content);
   return `${tool}::${normalized}::${cwd}`;
 }
 
@@ -64,55 +64,63 @@ export class AllowList {
 
   /**
    * Check if a decision is remembered (session or permanent).
-   * Matching order (§6.2): exact key first, then the entry's optional
-   * `pattern` glob over the normalized command, then the optional `domain`
-   * scope over the command's path-like arguments.
+   * Legacy exact entries stay cwd-scoped.  Entries carrying `pattern`
+   * and/or `domain` must satisfy ALL of their constraints (B3): the glob
+   * matches the full normalized command at argument boundaries, and every
+   * filesystem target resolves inside the domain — including quoted,
+   * relative, and symlinked targets (B4).  Undeterminable targets make the
+   * domain check fail so the command falls back to normal approval.
    */
   isAllowed(tool: string, content: string, cwd: string): boolean {
     const key = makeAllowKey(tool, content, cwd);
     if (this.sessionAllows.has(key)) return true;
-    const normalized = tool === "bash" ? normalize(content) : path.resolve(content);
+    const normalized = tool === "bash" ? normalize(content) : path.resolve(cwd, content);
     return this.permanent.some((e) => {
       if (e.tool !== tool) return false;
-      // Exact entries stay cwd-scoped; pattern/domain entries carry their
-      // own scope and apply from any cwd.
-      if (e.key === normalized && e.cwd === cwd) return true;
-      if (typeof e.pattern === "string" && matchGlob(e.pattern, normalized)) return true;
-      if (typeof e.domain === "string" && this.allTargetsWithinDomain(normalized, e, cwd)) return true;
-      return false;
+      const scoped = typeof e.pattern === "string" || typeof e.domain === "string";
+      if (!scoped) return e.key === normalized && e.cwd === cwd;
+      if (typeof e.pattern === "string" && !matchCommandGlob(e.pattern, normalized)) return false;
+      if (typeof e.domain === "string" && !this.allTargetsWithinDomain(tool, content, e, cwd)) {
+        return false;
+      }
+      return true;
     });
   }
 
   /**
-   * `domain` entries allow a command only when every path-like argument
-   * resolves inside the recorded domain.  Commands with no path arguments
-   * match when the current cwd itself is inside the domain.
+   * `domain` entries allow a command only when every filesystem target
+   * resolves inside the recorded domain (lexical AND canonical — an
+   * in-domain symlink pointing outside fails).  Commands with no targets
+   * match only when the execution cwd itself is inside the domain.
+   * Non-bash tools use their resolved subject path as the single target.
    */
-  private allTargetsWithinDomain(normalized: string, entry: AllowEntry, cwd: string): boolean {
+  private allTargetsWithinDomain(
+    tool: string,
+    content: string,
+    entry: AllowEntry,
+    cwd: string,
+  ): boolean {
     const domain = resolveFilesystemPathCandidates(entry.domain ?? "", entry.cwd);
-    const within = (target: string, base: string): boolean =>
-      resolveFilesystemPathCandidates(target, base).some((candidate) =>
-        domain.some((directory) =>
-          candidate === directory ||
-          candidate.startsWith(directory.endsWith("/") ? directory : `${directory}/`),
-        ),
+    const withinDomain = (candidate: string): boolean =>
+      domain.some((directory) =>
+        candidate === directory ||
+        candidate.startsWith(directory.endsWith("/") ? directory : `${directory}/`),
       );
+    const resolvesInside = (target: string, base: string): boolean => {
+      const candidates = resolveFilesystemPathCandidates(target, base);
+      return candidates.length > 0 && candidates.every(withinDomain);
+    };
 
-    const pathTokens = normalized.split(/\s+/).map((token) => {
-      const value = token.includes("=") ? token.split("=").pop() ?? "" : token;
-      return value.replace(/^["']|["']$/g, "");
-    }).filter((cleaned) =>
-      cleaned.startsWith("/") || cleaned.startsWith("~") || cleaned.startsWith(".") ||
-      cleaned.startsWith("$HOME"),
-    );
-    if (pathTokens.length === 0) {
-      return domain.some((root) =>
-        resolveFilesystemPathCandidates(cwd, cwd).some((candidate) =>
-          candidate === root || candidate.startsWith(`${root}/`),
-        ),
-      );
+    if (tool !== "bash") {
+      return resolvesInside(path.resolve(cwd, content), cwd);
     }
-    return pathTokens.every((token) => within(token, cwd));
+
+    const { targets, undeterminable } = commandFileTargets(content, cwd);
+    if (undeterminable) return false;
+    if (targets.length === 0) {
+      return resolveFilesystemPathCandidates(cwd, cwd).every(withinDomain);
+    }
+    return targets.every((target) => resolvesInside(target.value, target.cwd));
   }
 
   /** Record a session allow. */
@@ -124,7 +132,7 @@ export class AllowList {
   rememberPermanent(tool: string, content: string, cwd: string): void {
     const entry: AllowEntry = {
       tool,
-      key: tool === "bash" ? normalize(content) : path.resolve(content),
+      key: tool === "bash" ? normalize(content) : path.resolve(cwd, content),
       cwd,
       timestamp: new Date().toISOString(),
     };

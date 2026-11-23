@@ -286,3 +286,116 @@ send({ type: "ready", protocolVersion: 1 });
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ── Suggestion: privileged caution note reaches all three model inputs ─
+
+test("privileged caution note reaches the Pi classifier state", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smart-approve-pi-note-"));
+  const logger = new Logger(dir);
+  const note = translations.promptPrivilegedNote;
+  let detected: unknown;
+  const classifierModel = { id: "jev-latest", provider: "typesafe", type: "classifier" };
+  const registry: HostModelRegistry = {
+    getModelOfType: () => classifierModel,
+    classify: async (_model, request) => {
+      if (typeof request === "object" && request !== null && "state" in request) {
+        const state = request.state;
+        if (typeof state === "object" && state !== null && "detectedBehaviors" in state) {
+          detected = state.detectedBehaviors;
+        }
+      }
+      return {
+        stopReason: "stop",
+        answers: {
+          risk: { type: "choice", choice: "low", probabilities: {}, confidence: 1 },
+          recommend: { type: "choice", choice: "allow", probabilities: {}, confidence: 1 },
+        },
+      };
+    },
+  };
+  const invoker = new ModelInvoker(makeForbiddenRpcHost(logger), logger, 1_000, 0);
+  try {
+    await invoker.analyze(
+      "sudo -v",
+      "Shell command",
+      [note],
+      contextSection,
+      translations,
+      "typesafe/jev-latest",
+      undefined,
+      contextWithRegistry(registry),
+    );
+    assert.ok(Array.isArray(detected) && detected.includes(note), `state missing note: ${JSON.stringify(detected)}`);
+  } finally {
+    invoker.dispose();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("privileged caution note reaches the OMP native judge state", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smart-approve-omp-note-"));
+  const logger = new Logger(dir);
+  const note = translations.promptPrivilegedNote;
+  const model = getBundledModel("openrouter", "~typesafe/jev-latest");
+  let detected: unknown;
+  const registry: HostModelRegistry = {
+    find: () => model,
+    resolver: () => "registry-token",
+    resolveModelHeaders: async () => ({}),
+  };
+  const support: OmpNativeJudgmentSupport = {
+    isJudgmentApi: (api) => api === model.api,
+    createNativeJudge: () => ({
+      judge: async (request: unknown) => {
+        if (typeof request === "object" && request !== null && "state" in request) {
+          const state = request.state;
+          if (typeof state === "object" && state !== null && "detectedBehaviors" in state) {
+            detected = state.detectedBehaviors;
+          }
+        }
+        return {
+          answers: {
+            risk: { type: "choice", choice: "low" },
+            recommend: { type: "choice", choice: "allow" },
+          },
+        };
+      },
+    }),
+  };
+  const invoker = new ModelInvoker(makeForbiddenRpcHost(logger), logger, 1_000, 0, async () => support);
+  try {
+    await invoker.analyze(
+      "sudo -v",
+      "Shell command",
+      [note],
+      contextSection,
+      translations,
+      `${model.provider}/${model.id}`,
+      undefined,
+      contextWithRegistry(registry),
+    );
+    assert.ok(Array.isArray(detected) && detected.includes(note), `state missing note: ${JSON.stringify(detected)}`);
+  } finally {
+    invoker.dispose();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("privileged caution note reaches the chat RPC prompt", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smart-approve-rpc-note-"));
+  const logger = new Logger(dir);
+  const note = translations.promptPrivilegedNote;
+  const invoker = new ModelInvoker(new HostResolver(logger), logger, 1_000, 0);
+  let prompt = "";
+  invoker.invoke = async (text: string) => {
+    prompt = text;
+    return null;
+  };
+  try {
+    await invoker.analyze("sudo -v", "Shell command", [note], contextSection, translations, "@tiny");
+    assert.ok(prompt.includes(note), "RPC prompt missing caution note");
+  } finally {
+    invoker.dispose();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

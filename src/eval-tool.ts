@@ -107,6 +107,7 @@ export class EvalToolGate extends ToolGate {
       cwd,
       sessionCwd,
       this.hostToolContext(),
+      ctx.hasUI,
     );
     const writeTargets = extractEvalWriteTargets(subject, language);
     const hostToolTargets = writeTargets.hostToolTargets ?? [];

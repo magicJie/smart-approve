@@ -14,7 +14,7 @@
  */
 
 import type { DangerAnalysis } from "./types.ts";
-import { analyzeCommand, isSensitiveWorkingDirectory } from "./behaviors.ts";
+import { analyzeBashOperation, isSensitiveWorkingDirectory, labelForBehavior } from "./behaviors.ts";
 import { makeLabel } from "./i18n.ts";
 import { resolveFilesystemPathCandidates } from "./paths.ts";
 import * as fs from "node:fs";
@@ -1532,6 +1532,7 @@ export class EvalCodeBehaviorAnalyzer {
     baseCwd?: string,
     sessionCwd?: string,
     hostContext?: EvalHostToolContext,
+    hasUI = true,
   ): DangerAnalysis {
     const source = String(code ?? "");
     const withStrings = scrub(source, true);
@@ -1597,14 +1598,29 @@ export class EvalCodeBehaviorAnalyzer {
     const launchCommands = [
       ...extractSpawnCommandText(codeText, childProcessImport),
       ...(pythonScan?.commands ?? []),
-    ].flatMap(splitShellSegments);
-    const riskyLaunch =
-      hasProcessSpawn &&
-      !dangerousPayload &&
-      launchCommands.some((command) => {
-        const behaviors = analyzeCommand(command).behaviors;
-        return behaviors.includes("high-risk-shell-pivot");
-      });
+    ];
+    // B2: statically recognizable spawn commands go through the full bash
+    // analysis so their own behaviors, hard blocks, and headless shutdown
+    // confirmations survive the eval hop (privileged-exec keeps its label
+    // for the LLM caution note).
+    let innerHardBlocked = false;
+    let innerRequiresConfirmation = false;
+    let innerDenyTier = false;
+    let shellPivot = false;
+    if (hasProcessSpawn) {
+      for (const command of launchCommands) {
+        const inner = analyzeBashOperation(command, base, session, { hasUI });
+        for (const behavior of inner.behaviors) {
+          if (behavior === "sensitive-working-directory") continue;
+          found.add(behavior);
+        }
+        if (inner.hardBlocked) innerHardBlocked = true;
+        if (inner.requiresConfirmation) innerRequiresConfirmation = true;
+        if (inner.denyTier) innerDenyTier = true;
+        if (inner.behaviors.includes("high-risk-shell-pivot")) shellPivot = true;
+      }
+    }
+    const riskyLaunch = hasProcessSpawn && !dangerousPayload && shellPivot;
     const riskyArguments =
       hasProcessSpawn &&
       !dangerousPayload &&
@@ -1667,21 +1683,24 @@ export class EvalCodeBehaviorAnalyzer {
     const requiresConfirmation =
       shellUnresolvedCwd ||
       pythonScan?.externalSource === true ||
+      innerRequiresConfirmation ||
       found.has("eval-dynamic-host-tool-invocation");
     if (pythonScan?.externalSource) found.add("eval-external-source");
 
-    // Sensitive cwd transitions are reviewable (DESIGN §3.1), not hard stops.
-    const hardBlocked = dangerousPayload || riskyLaunch || riskyArguments;
+    // Sensitive cwd transitions are reviewable (DESIGN §3.1), not hard stops;
+    // inner spawn hard blocks still apply (B2).
+    const hardBlocked = dangerousPayload || riskyLaunch || riskyArguments || innerHardBlocked;
 
     const behaviors = [...found];
-    const labels = behaviors.map((behavior) => BEHAVIORS[behavior] || makeLabel(behavior, behavior));
+    const labels = behaviors.map((behavior) => BEHAVIORS[behavior] || labelForBehavior(behavior));
     const analysis: DangerAnalysis = {
       behaviors,
       labels,
       hardBlocked,
       // A statically identified MCP call has no regex-level safe/unsafe verdict.
       // When no model verdict is available, auto mode must not infer safety.
-      denyTier: found.has("eval-mcp-tool-invocation"),
+      // Inner spawn deny-tier verdicts also survive the eval hop (B2).
+      denyTier: found.has("eval-mcp-tool-invocation") || (!hardBlocked && innerDenyTier),
     };
     // `%run` reads a file whose contents can change, an unresolved shell cwd
     // can make the same source target different paths, and a dynamic host-tool

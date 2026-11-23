@@ -12,6 +12,7 @@ import { makeLabel } from "./i18n";
 import { isUserWritablePath, resolveFilesystemPathCandidates } from "./paths";
 import * as os from "node:os";
 import * as path from "node:path";
+import * as fs from "node:fs";
 
 // ── Behavior catalog ─────────────────────────────────────────────────
 
@@ -368,7 +369,10 @@ function stripShellSubstitutions(
 
 
 
-function commandAndArgs(segment: string): { name: string; args: string[] } | undefined {
+function commandAndArgs(
+  segment: string,
+  options: { unwrapXargs?: boolean } = {},
+): { name: string; args: string[] } | undefined {
   const tokens = roughTokenize(segment);
   let index = 0;
 
@@ -397,7 +401,7 @@ function commandAndArgs(segment: string): { name: string; args: string[] } | und
       }
       continue;
     }
-    if (name === "xargs") {
+    if (name === "xargs" && options.unwrapXargs !== false) {
       index++;
       while (index < tokens.length) {
         const option = unquoteToken(tokens[index]);
@@ -726,12 +730,11 @@ function isWithinDirectory(candidate: string, directory: string): boolean {
 
 /**
  * Permission-change hard-block scope (DESIGN §3.3/§4.2):
- *  - resolved targets under system directories are `permission-change-system`;
+ *  - resolved targets under system directories or the root dir itself are
+ *    `permission-change-system`;
  *  - chmod/chown of the home root itself is `permission-change-system`;
  *  - chown whose OWNER differs from the current user is `permission-change-system`;
- *  - targets inside home or the session cwd are `permission-change-user`.
- * Out-of-domain paths stay reviewable (`permission-change-user` tier) — the
- * LLM decides with task context rather than a hard stop.
+ *  - everything else is `permission-change-user` (reviewable — LLM judges).
  */
 const PERMISSION_SYSTEM_PATH_RE =
   /^\/(?:etc|usr|bin|sbin|var|boot|sys|proc|root|Library|System)(?:\/|$)/i;
@@ -740,59 +743,242 @@ const PERMISSION_SYSTEM_PATH_RE =
 const BLOCK_DEVICE_PATH_RE =
   /^\/dev\/(?:sd[a-z]\d*|nvme\d+(?:n\d+)?(?:p\d+)?|disk\d+(?:s\d+)?|hd[a-z]\d*|vd[a-z]\d*|xvd[a-z]\d*|mmcblk\d+(?:p\d+)?|mapper\/[^/]+|md\d+|sg\d+|st\d+|nst\d+)$/i;
 
-interface PermissionInvocation {
+/** Pipelines whose right side executes an interpreter are remote-fetch-exec
+ *  regardless of the fetcher spelling. */
+const PIPE_INTERPRETERS: Record<string, true> = {
+  sh: true, bash: true, zsh: true, fish: true, python3: true, python: true,
+  perl: true, ruby: true, node: true,
+};
+
+/** POSIX-family shells whose `-c` operand is literal shell text we can
+ *  unwrap and re-analyze (B1: literal inline commands keep classifying). */
+const POSIX_SHELLS: Record<string, true> = {
+  sh: true, bash: true, zsh: true, dash: true, csh: true, tcsh: true, ksh: true, fish: true,
+};
+
+interface CommandInvocation {
   name: string;
   args: string[];
 }
 
-/** Parse the OWNER[:GROUP] spec of a chown invocation (chgrp has none). */
-function chownOwner(args: string[]): string | undefined {
-  const operands = args.filter((arg) => arg !== "--" && !arg.startsWith("-"));
-  const spec = operands[0];
-  if (spec === undefined) return undefined;
-  const owner = spec.split(":")[0];
-  return owner === "" ? undefined : owner;
+/** Split at ;, &&, ||, newline, bare & and parens — but NOT single `|`
+ *  (pipes stay inside a group so adjacent stages keep their fetcher→shell
+ *  adjacency).  Quote- and escape-aware, same as splitShellCommands. */
+function commandGroups(command: string): string[] {
+  const result: string[] = [];
+  let start = 0;
+  let quote: string | undefined;
+  let escaped = false;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (escaped) { escaped = false; continue; }
+    if (ch === "\\") { escaped = true; continue; }
+    if (quote !== undefined) {
+      if (ch === quote) quote = undefined;
+      continue;
+    }
+    if (ch === "'" || ch === "\"" || ch === "`") { quote = ch; continue; }
+    if (ch === ";" || ch === "\n" || ch === "(" || ch === ")") {
+      const segment = command.slice(start, i).trim();
+      if (segment) result.push(segment);
+      start = i + 1;
+      continue;
+    }
+    if (ch === "&") {
+      const segment = command.slice(start, i).trim();
+      if (segment) result.push(segment);
+      if (command[i + 1] === "&") i++;
+      start = i + 1;
+      continue;
+    }
+    if (ch === "|" && command[i + 1] === "|") {
+      const segment = command.slice(start, i).trim();
+      if (segment) result.push(segment);
+      start = i + 2;
+      i++;
+    }
+  }
+  const tail = command.slice(start).trim();
+  if (tail) result.push(tail);
+  return result;
+}
+
+/** Split one group at unquoted single `|` (skips `||`). */
+function pipeStages(group: string): string[] {
+  const result: string[] = [];
+  let start = 0;
+  let quote: string | undefined;
+  let escaped = false;
+  for (let i = 0; i < group.length; i++) {
+    const ch = group[i];
+    if (escaped) { escaped = false; continue; }
+    if (ch === "\\") { escaped = true; continue; }
+    if (quote !== undefined) {
+      if (ch === quote) quote = undefined;
+      continue;
+    }
+    if (ch === "'" || ch === "\"" || ch === "`") { quote = ch; continue; }
+    if (ch === "|" && group[i + 1] !== "|") {
+      result.push(group.slice(start, i).trim());
+      start = i + 1;
+    }
+  }
+  result.push(group.slice(start).trim());
+  return result.filter((stage) => stage.length > 0);
 }
 
 /**
- * Classify one chmod/chown invocation by target domain.  `cwd` is the
- * effective command cwd used to resolve relative targets; `sessionCwd`
- * bounds the task domain.  Returns the behavior id to emit.
+ * The literal local command text launched inside a local wrapper —
+ * `sudo rm -rf /` → `rm -rf /`, `ssh host chmod 777 /etc/x` → `chmod 777 /etc/x`,
+ * `bash -c 'rm -rf /'` → `rm -rf /`.  Option parsing follows each tool's
+ * operand grammar; unparseable wrappers return undefined (outer verdict
+ * alone applies).  `~user`-style unknown expansions are never guessed.
+ */
+function innerWrappedCommand(invocation: CommandInvocation): string | undefined {
+  const { name, args } = invocation;
+  if (name === "sudo" || name === "doas") {
+    const optionWithValue = new Set(["-u", "--user", "-g", "--group", "-C", "--close-from",
+      "-D", "--chdir", "-h", "--host", "-p", "--prompt", "-R", "--role", "-t", "--type",
+      "-T", "--command-timeout", "-U", "--other-user"]);
+    let i = 0;
+    while (i < args.length) {
+      const arg = args[i];
+      if (arg === "--") { i++; break; }
+      if (!arg.startsWith("-")) break;
+      if (optionWithValue.has(arg)) { i += 2; continue; }
+      if (/^-[a-zA-Z]+$/.test(arg) || arg.startsWith("--")) { i++; continue; }
+      i++;
+    }
+    return args.slice(i).map((arg) => /\s/.test(arg) ? quoteShellArgument(arg) : arg).join(" ") || undefined;
+  }
+  if (name === "ssh") {
+    const optionWithValue = new Set(["-b", "-c", "-D", "-E", "-e", "-F", "-I", "-i",
+      "-J", "-L", "-l", "-m", "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w"]);
+    let i = 0;
+    while (i < args.length) {
+      const arg = args[i];
+      if (arg === "--") { i++; break; }
+      if (!arg.startsWith("-")) break;
+      if (optionWithValue.has(arg)) { i += 2; continue; }
+      i++;
+    }
+    // First operand is user@host; the rest is the remote command line.
+    return args.slice(i + 1).map((arg) => /\s/.test(arg) ? quoteShellArgument(arg) : arg).join(" ") || undefined;
+  }
+  if (POSIX_SHELLS[name] === true) {
+    for (let i = 0; i < args.length; i++) {
+      if (args[i] === "-c" && args[i + 1] !== undefined) return args[i + 1];
+    }
+  }
+  return undefined;
+}
+
+/** Expand the HOME forms resolvable without running the shell (~, $HOME,
+ *  ${HOME}).  Any other $/`/glob/`~user` form is dynamic → undefined. */
+function expandHomeLiteral(value: string, home: string): string | undefined {
+  let expanded = value;
+  if (!expanded) return undefined;
+  if (expanded === "~") expanded = home;
+  else if (expanded.startsWith("~/")) expanded = path.join(home, expanded.slice(2));
+  else if (expanded.startsWith("~")) return undefined; // ~user needs a lookup
+  const placeholder = "\0HOME\0";
+  expanded = expanded
+    .replace(/\$\{HOME\}/g, placeholder)
+    .replace(/\$HOME(?![A-Za-z0-9_])/g, placeholder);
+  if (/[$`{}\[\]*?]/.test(expanded)) return undefined;
+  return expanded.split(placeholder).join(home) || undefined;
+}
+
+/**
+ * realpath-semantics resolution: components resolve in order, so a `..`
+ * after a symlinked directory escapes the link target, matching what the
+ * filesystem actually does.  Falls back to the lexical candidate list when
+ * the prefix doesn't exist.
+ */
+function semanticPathCandidates(target: string, baseCwd: string): string[] {
+  const lexical = resolveFilesystemPathCandidates(target, baseCwd);
+  const absolute = lexical[0];
+  if (!absolute || absolute.startsWith("/") === false) return lexical;
+  const parts = absolute.split("/").filter(Boolean);
+  let current = "/";
+  try {
+    for (const part of parts) {
+      if (part === "..") {
+        current = path.dirname(fs.realpathSync(current));
+        continue;
+      }
+      current = fs.realpathSync(path.join(current, part));
+    }
+  } catch {
+    return lexical;
+  }
+  return current === absolute ? [absolute] : [absolute, current];
+}
+
+function isSystemTarget(value: string): boolean {
+  return value === "/" || PERMISSION_SYSTEM_PATH_RE.test(value);
+}
+
+/** chmod/chown/chgrp operands with tool grammar: option args and the
+ *  leading MODE / OWNER[:GROUP] / GROUP / --reference operands excluded. */
+function permissionTargets(name: string, args: string[]): { targets: string[]; owner?: string } {
+  let i = 0;
+  let skipFirstOperand = true;
+  const targets: string[] = [];
+  let owner: string | undefined;
+  while (i < args.length) {
+    const arg = args[i];
+    if (arg === "--") { i++; break; }
+    if (!arg.startsWith("-")) break;
+    if (arg.startsWith("--reference=")) { skipFirstOperand = false; i++; continue; }
+    if (arg === "--reference") { skipFirstOperand = false; i += 2; continue; }
+    i++;
+  }
+  const operands = args.slice(i);
+  const list = skipFirstOperand ? operands.slice(1) : operands;
+  if (name === "chown" && skipFirstOperand) {
+    const spec = operands[0];
+    const ownerPart = spec?.split(":")[0];
+    owner = ownerPart === "" ? undefined : ownerPart;
+  }
+  return { targets: list, owner };
+}
+
+/**
+ * Classify one chmod/chown/chgrp invocation by target domain.  `cwd` is the
+ * effective cwd at the segment executing it.  Targets are expanded for ~ and
+ * $HOME, resolved with realpath semantics, and checked for system dirs, the
+ * root dir, and the home root.  Unknown targets stay reviewable.
  */
 function permissionChangeTier(
-  invocation: PermissionInvocation,
+  invocation: CommandInvocation,
   cwd: string,
-  sessionCwd: string,
+  cwdKnown: boolean,
   home = process.env.HOME || os.homedir(),
   user = process.env.USER || os.userInfo().username,
 ): "permission-change-system" | "permission-change-user" {
   const { name, args } = invocation;
-  const operands = args.filter((arg) => arg !== "--" && !arg.startsWith("-"));
-  const targets = name === "chmod"
-    ? operands.slice(1)
-    : name === "chgrp"
-      ? operands.slice(1)
-      : operands.slice(1); // chown: OWNER[:GROUP] first
+  const { targets, owner } = permissionTargets(name, args);
 
-  if (name === "chown") {
-    const owner = chownOwner(args);
-    if (owner !== undefined && owner !== user) return "permission-change-system";
+  if (name === "chown" && owner !== undefined && owner !== user) {
+    return "permission-change-system";
   }
 
   const homeCandidates = resolveFilesystemPathCandidates(home, home);
-  for (const target of targets) {
-    if (PERMISSION_SYSTEM_PATH_RE.test(target)) return "permission-change-system";
-    const candidates = resolveFilesystemPathCandidates(target, cwd);
+  for (const raw of targets) {
+    const expanded = expandHomeLiteral(raw, home);
+    if (expanded === undefined) continue; // dynamic — reviewable, LLM judges
+    if (isSystemTarget(expanded)) return "permission-change-system";
+    const candidates = cwdKnown
+      ? semanticPathCandidates(expanded, cwd)
+      : resolveFilesystemPathCandidates(expanded, home);
     for (const candidate of candidates) {
-      if (PERMISSION_SYSTEM_PATH_RE.test(candidate)) return "permission-change-system";
-      // chmod/chown of the home root itself stays a hard stop.
+      if (isSystemTarget(candidate)) return "permission-change-system";
       if (homeCandidates.some((root) => candidate === root)) {
         return "permission-change-system";
       }
     }
   }
-  // Out-of-domain paths stay reviewable (§4.2): the LLM judges whether the
-  // task authorizes the target; the hard stops above already fired.
   return "permission-change-user";
 }
 
@@ -812,6 +998,7 @@ export function permissionChangeInvocations(command: string): PermissionInvocati
         for (const commandArgs of findExecCommands(invocation.args)) {
           pending.push(commandArgs.map(quoteShellArgument).join(" "));
         }
+        i += 2;
         continue;
       }
       if (["chmod", "chown", "chgrp"].includes(invocation.name)) {
@@ -819,7 +1006,7 @@ export function permissionChangeInvocations(command: string): PermissionInvocati
       }
     }
   }
-  return invocations;
+  return { targets, undeterminable };
 }
 
 
@@ -1108,9 +1295,11 @@ function analyzeGit(args: string[]): string[] {
 // ── Composite analysis ───────────────────────────────────────────────
 
 /** Behaviors that are always hard-blocked (no LLM review, no allow).
- *  These mirror the former HubLaunchGuard's no-override rejections:
- *  legacy high-risk launches, destructive filesystem commands, and
- *  sensitive working directories. */
+ *  Irreversible-by-construction operations only (DESIGN §三): recursive
+ *  deletes of root/home/system paths, fork bombs, fetch-and-execute pipes,
+ *  system account-file access, raw device writes, filesystem formatting,
+ *  reverse-shell pivots, system/home-root permission changes, and dd to
+ *  block devices.  Wrapped and eval-spawned forms merge the same verdict. */
 const HARD_BLOCK_BEHAVIORS: Record<string, true> = {
   "recursive-force-delete": true,
   "delete-root": true,
@@ -1159,12 +1348,44 @@ export function analyzeCommand(cmd: string): DangerAnalysis {
 
     const executableCommand = stripShellSubstitutions(command, substitutions);
     const syntax = stripQuotedShellData(executableCommand);
-    const segments = splitShellCommands(executableCommand);
 
-    for (const segment of segments) {
+    for (const group of commandGroups(executableCommand)) {
+      const stages = pipeStages(group);
+
+      // A pipe whose right side executes an interpreter is remote-fetch-exec:
+      // curl|wget|fetch|echo|printf data piped straight into sh/python/….
+      // Judged on the actual parsed stage programs (basename semantics),
+      // so /usr/bin/curl, quoted args, and `curl x; sh -c y` behave correctly.
+      if (stages.length >= 2) {
+        // Direct interpreter execution only: `… | xargs bash -n` runs a fixed
+        // script with piped data as arguments, not a fetched script, so xargs
+        // is not unwrapped at the pipe's right end.
+        const last = commandAndArgs(stages[stages.length - 1], { unwrapXargs: false });
+        if (last && (PIPE_INTERPRETERS[last.name] === true ||
+          ((last.name === "sudo" || last.name === "doas") &&
+            (() => {
+              const inner = innerWrappedCommand(last);
+              if (!inner) return false;
+              const innerInvocation = commandAndArgs(inner, { unwrapXargs: false });
+              return innerInvocation !== undefined && PIPE_INTERPRETERS[innerInvocation.name] === true;
+            })()))) {
+          for (let index = 0; index < stages.length - 1; index++) {
+            const source = commandAndArgs(stages[index]);
+            if (source && ["curl", "wget", "fetch", "echo", "printf"].includes(source.name)) {
+              behaviorSet.add("remote-fetch-exec");
+              break;
+            }
+          }
+        }
+      }
+
+      for (const segment of stages) {
       const invocation = commandAndArgs(segment);
       if (!invocation) continue;
       const { name, args } = invocation;
+
+      const inner = innerWrappedCommand(invocation);
+      if (inner !== undefined) pending.push(inner);
 
       if (name === "git") {
         for (const behavior of analyzeGit(args)) behaviorSet.add(behavior);
@@ -1290,18 +1511,10 @@ export function analyzeCommand(cmd: string): DangerAnalysis {
         if (sensitiveSystemWrite || blockDeviceWrite) behaviorSet.add("write-sensitive-file");
         if (blockDeviceWrite) behaviorSet.add("write-block-device");
       }
+      }
     }
 
     if (FORK_BOMB_PATTERN.test(syntax)) behaviorSet.add("fork-bomb");
-    if (
-      /(?:^|[;&|])\s*(?:echo|printf)\b[^|\n]*\|\s*(?:sudo\s+)?(?:sh|bash|zsh|fish|python3?|perl|ruby|node)\b/i.test(syntax) ||
-      /(?:^|[;&|])\s*(?:(?:env|command|nohup)\s+)*fetch\b[^|\n]*\|\s*(?:sudo\s+)?(?:sh|bash|zsh|fish|python3?|perl|ruby|node)\b/i.test(syntax) ||
-      // curl/wget piped straight into an interpreter is the classic supply-chain
-      // pattern; it must stay hard-blocked now that curl/wget are reviewable.
-      /(?:^|[;&|])\s*(?:(?:env|command|nohup|timeout\s+\S+|nice|sudo)\s+)*(?:curl|wget)\b[^|\n]*\|\s*(?:sudo\s+)?(?:sh|bash|zsh|fish|python3?|perl|ruby|node)\b/i.test(syntax)
-    ) {
-      behaviorSet.add("remote-fetch-exec");
-    }
   }
 
   const behaviors = [...behaviorSet];
@@ -1313,10 +1526,18 @@ export function analyzeCommand(cmd: string): DangerAnalysis {
   return { behaviors, labels, hardBlocked, denyTier };
 }
 
+/** Localized label lookup shared with the eval analyzer (B2). */
+export function labelForBehavior(id: string): { en: string; zh: string } {
+  return BEHAVIORS[id] || makeLabel(id, id);
+}
+
 /**
  * Analyze a command plus its explicit execution cwd.
  * Adds cwd/session-scoped behaviors on top of analyzeCommand:
- *  - permission-change → permission-change-system (hard) or -user (reviewable)
+ *  - permission-change → permission-change-system (hard) or -user (reviewable),
+ *    classified per segment with `cd` tracking and realpath semantics (B5)
+ *  - dd of= targets resolve against the effective cwd; existing block devices
+ *    are detected by file type, not just spelling (B7)
  *  - sensitive-working-directory → reviewable (was hard block; DESIGN §3.1)
  *  - hasUI=false → shutdown-reboot requires confirmation (headless auto-reject, §九-1b)
  */
@@ -1324,22 +1545,107 @@ export function analyzeBashOperation(
   command: string,
   cwd: string,
   sessionCwd: string,
-  hasUI = true,
+  options: {
+    hasUI?: boolean;
+    isBlockDevice?: (target: string) => boolean;
+  } = {},
 ): DangerAnalysis {
+  const hasUI = options.hasUI ?? true;
+  const isBlockDevice = options.isBlockDevice ?? ((target: string): boolean => {
+    try {
+      return fs.statSync(target).isBlockDevice();
+    } catch {
+      return false;
+    }
+  });
+
   const analysis = analyzeCommand(command);
 
   const behaviorSet = new Set(analysis.behaviors);
-  for (const invocation of permissionChangeInvocations(command)) {
-    behaviorSet.add(permissionChangeTier(invocation, cwd, sessionCwd));
+  let currentCwd = cwd;
+  let cwdKnown = true;
+  const pending: { text: string; cwd: string; cwdKnown: boolean }[] = [
+    { text: normalize(command), cwd, cwdKnown: true },
+  ];
+  while (pending.length > 0) {
+    const entry = pending.pop()!;
+    currentCwd = entry.cwd;
+    cwdKnown = entry.cwdKnown;
+    const substitutions = findShellSubstitutions(entry.text);
+    for (const substitution of substitutions) {
+      pending.push({ text: substitution.body, cwd: currentCwd, cwdKnown });
+    }
+    const executableCommand = stripShellSubstitutions(entry.text, substitutions);
+    for (const group of commandGroups(executableCommand)) {
+      for (const stage of pipeStages(group)) {
+        const invocation = commandAndArgs(stage);
+        if (!invocation) continue;
+        const { name, args } = invocation;
+
+        const inner = innerWrappedCommand(invocation);
+        if (inner !== undefined) {
+          pending.push({ text: inner, cwd: currentCwd, cwdKnown });
+        }
+        if (name === "find") {
+          for (const commandArgs of findExecCommands(args)) {
+            pending.push({
+              text: commandArgs.map(quoteShellArgument).join(" "),
+              cwd: currentCwd,
+              cwdKnown,
+            });
+          }
+        }
+
+        if (name === "cd") {
+          const operand = args.find((arg) => arg !== "--" && !arg.startsWith("-"));
+          const home = process.env.HOME || os.homedir();
+          const expanded = operand === undefined ? home : expandHomeLiteral(operand, home);
+          if (expanded === undefined || !cwdKnown) {
+            cwdKnown = false;
+            continue;
+          }
+          const candidates = semanticPathCandidates(expanded, currentCwd);
+          currentCwd = candidates[candidates.length - 1] ?? expanded;
+          continue;
+        }
+
+        if (["chmod", "chown", "chgrp"].includes(name)) {
+          behaviorSet.add(permissionChangeTier(invocation, currentCwd, cwdKnown));
+        }
+
+        if (name === "dd") {
+          for (const arg of args.filter((value) => /^of=/.test(value))) {
+            const expanded = expandHomeLiteral(arg.slice(3), process.env.HOME || os.homedir());
+            if (expanded === undefined) {
+              behaviorSet.add("dd-write");
+              continue;
+            }
+            const candidates = cwdKnown
+              ? semanticPathCandidates(expanded, currentCwd)
+              : [expanded];
+            const blockDevice = candidates.some(
+              (candidate) =>
+                BLOCK_DEVICE_PATH_RE.test(candidate.replace(/\\/g, "/")) ||
+                isBlockDevice(candidate),
+            );
+            if (blockDevice) {
+              behaviorSet.delete("dd-write");
+              behaviorSet.add("dd-block-device");
+            } else {
+              behaviorSet.add("dd-write");
+            }
+          }
+        }
+      }
+    }
   }
+
   if (isSensitiveWorkingDirectory(cwd, sessionCwd)) {
     behaviorSet.add("sensitive-working-directory");
   }
 
   const behaviors = [...behaviorSet];
-  const labels = behaviors.map((behavior) =>
-    BEHAVIORS[behavior] || makeLabel(behavior, behavior),
-  );
+  const labels = behaviors.map(labelForBehavior);
   const hardBlocked = behaviors.some((behavior) => behavior in HARD_BLOCK_BEHAVIORS);
   const denyTier =
     !hardBlocked && behaviors.some((behavior) => behavior in DENY_TIER_BEHAVIORS);

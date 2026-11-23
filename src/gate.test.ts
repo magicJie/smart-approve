@@ -1166,3 +1166,115 @@ test("eval: auto mode AI-allow delegates subprocess code", async () => {
   assert.equal(h.calls.delegate, 1);
   assert.equal(h.calls.analyze, 1);
 });
+
+// ── REVIEW B1: wrapped hard blocks precede the allowlist ──────────────
+
+test("bash: wrapped hard blocks reject before allowlist, headless wrapped shutdown rejects", async () => {
+  const allowed = makeHarness({}, { isAllowed: true });
+  const wrapped = await run(BashToolGate, allowed, { command: "sudo rm -rf /tmp/x" });
+  assert.equal(wrapped.isError, true);
+  assert.equal((wrapped.details as { blocked: boolean }).blocked, true);
+  assert.equal(allowed.calls.delegate, 0);
+  assert.equal(allowed.calls.analyze, 0);
+
+  const headless = makeHarness(
+    { mode: "auto", autoInHeadless: true },
+    { hasUI: false, isAllowed: true },
+  );
+  const shutdown = await run(BashToolGate, headless, { command: "sudo shutdown -h now" });
+  assert.equal(shutdown.isError, true);
+  assert.equal((shutdown.details as { reason: string }).reason, "no-ui");
+  assert.equal(headless.calls.analyze, 0, "no model call for headless wrapped shutdown");
+  assert.equal(headless.calls.delegate, 0);
+
+  // Plain wrapped command stays reviewable: model is consulted in auto.
+  const plain = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
+  const plainResult = await run(BashToolGate, plain, { command: "sudo ls" });
+  assert.equal(plain.calls.analyze, 1);
+  assert.equal(plainResult.content[0].text, "native-run");
+  assert.equal(plain.calls.delegate, 1);
+});
+
+// ── REVIEW B2: eval keeps inner verdicts and privileged note ──────────
+
+test("eval: headless shutdown returns no-ui with zero model and delegate calls", async () => {
+  for (const params of [
+    { language: "js", code: "Bun.$`shutdown -h now`;" },
+    { language: "py", code: "!shutdown -h now" },
+  ]) {
+    const h = makeHarness(
+      { mode: "interactive", autoInHeadless: true },
+      { hasUI: false },
+    );
+    const r = await run(EvalToolGate, h, params);
+    assert.equal(r.isError, true, params.code);
+    assert.equal((r.details as { reason: string }).reason, "no-ui", params.code);
+    assert.equal(h.calls.analyze, 0, params.code);
+    assert.equal(h.calls.delegate, 0, params.code);
+  }
+});
+
+test("eval: system permission changes hard-block without model calls", async () => {
+  for (const params of [
+    { language: "js", code: "Bun.$`chmod 777 /etc/foo`;" },
+    { language: "py", code: "!chmod 777 /etc/foo" },
+  ]) {
+    const h = makeHarness();
+    const r = await run(EvalToolGate, h, params);
+    assert.equal(r.isError, true, params.code);
+    assert.match(r.content[0].text, /^Blocked:/, params.code);
+    assert.equal(h.calls.analyze, 0, params.code);
+    assert.equal(h.calls.delegate, 0, params.code);
+  }
+});
+
+test("eval: privileged spawns carry the caution note to the model", async () => {
+  const h = makeHarness();
+  h.selectResult = h.deps.t.sessionAllow;
+  const labelsSeen: string[][] = [];
+  const original = h.deps.modelInvoker.analyze;
+  h.deps.modelInvoker = {
+    analyze: async (...args: Parameters<typeof original>) => {
+      labelsSeen.push(args[2]);
+      h.calls.analyze += 1;
+      return { risk: "low", recommend: "allow" };
+    },
+  };
+  const r = await run(EvalToolGate, h, { language: "py", code: "!ssh host" });
+  assert.equal(r.content[0].text, "native-run");
+  assert.equal(labelsSeen.length, 1);
+  assert.ok(
+    labelsSeen[0].includes(h.deps.t.promptPrivilegedNote),
+    `caution note missing from ${JSON.stringify(labelsSeen[0])}`,
+  );
+});
+
+// ── REVIEW B8: headless effective mode under the migrated config ──────
+
+test("gate: one migrated config drives UI dialog, headless model, headless confirm reject", async () => {
+  // The migrated shape: interactive + autoInHeadless (autoFallback regex).
+  const migrated = { mode: "interactive" as const, autoInHeadless: true, autoFallback: "regex" as const };
+
+  // With UI: reviewable command still goes through the dialog, not auto.
+  const ui = makeHarness(migrated, { hasUI: true });
+  ui.selectResult = ui.deps.t.sessionAllow;
+  const uiResult = await run(BashToolGate, ui, { command: "curl --version" });
+  assert.equal(ui.calls.analyze, 1, "UI path analyzes then prompts");
+  assert.ok(ui.selectChoices !== null, "UI path presents a dialog");
+  assert.equal(uiResult.content[0].text, "native-run");
+
+  // Headless + same config: reviewable command reaches the model (auto).
+  const headless = makeHarness(migrated, { hasUI: false });
+  const headlessResult = await run(BashToolGate, headless, { command: "curl --version" });
+  assert.equal(headless.calls.analyze, 1, "headless reviewable reaches the model");
+  assert.equal(headlessResult.content[0].text, "native-run");
+  assert.equal(headless.calls.delegate, 1);
+
+  // Headless + same config: forced-confirmation commands still reject.
+  const forced = makeHarness(migrated, { hasUI: false });
+  const forcedResult = await run(BashToolGate, forced, { command: "shutdown -h now" });
+  assert.equal(forcedResult.isError, true);
+  assert.equal((forcedResult.details as { reason: string }).reason, "no-ui");
+  assert.equal(forced.calls.analyze, 0);
+  assert.equal(forced.calls.delegate, 0);
+});

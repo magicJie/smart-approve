@@ -109,3 +109,149 @@ test("session tier is cwd-scoped and unaffected by pattern/domain", () => {
     cleanup(dir);
   }
 });
+
+// ── REVIEW B3: scoped entries enforce every constraint ────────────────
+
+test("combined pattern+domain entries reject single-side matches", () => {
+  const domain = "/home/jay/projects";
+  const { list, dir } = makeList([
+    {
+      tool: "bash",
+      key: "chmod 600 file",
+      cwd: CWD,
+      timestamp: "2026-01-01",
+      pattern: "chmod *",
+      domain,
+    },
+  ]);
+  try {
+    // Both constraints satisfied → allowed.
+    assert.equal(
+      list.isAllowed("bash", "chmod 600 /home/jay/projects/app/secret.env", CWD),
+      true,
+    );
+    // Pattern matches but the target escapes the domain → rejected.
+    assert.equal(list.isAllowed("bash", "chmod 600 /etc/hosts", CWD), false);
+    // Domain satisfied but the command is not chmod → rejected.
+    assert.equal(list.isAllowed("bash", "rm /home/jay/projects/app/file", CWD), false);
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("exact keys outside their scope are rejected", () => {
+  const { list, dir } = makeList([
+    {
+      tool: "bash",
+      key: "rm -rf /tmp/x",
+      cwd: CWD,
+      timestamp: "2026-01-01",
+      pattern: "chmod *",
+    },
+  ]);
+  try {
+    // Key+cwd match exactly, but the command violates the pattern scope.
+    assert.equal(list.isAllowed("bash", "rm -rf /tmp/x", CWD), false);
+  } finally {
+    cleanup(dir);
+  }
+});
+
+test("command globs reject extra command segments and honor negation", () => {
+  const { list, dir } = makeList([
+    {
+      tool: "bash",
+      key: "chmod 600 file",
+      cwd: CWD,
+      timestamp: "2026-01-01",
+      pattern: "chmod *",
+    },
+  ]);
+  const { list: negated, dir: negatedDir } = makeList([
+    {
+      tool: "bash",
+      key: "legacy",
+      cwd: CWD,
+      timestamp: "2026-01-01",
+      pattern: "!rm *",
+    },
+  ]);
+  try {
+    // Single-star globs may not cross argument boundaries or separators.
+    assert.equal(list.isAllowed("bash", "chmod 600 file; rm -rf /tmp/x", CWD), false);
+    assert.equal(list.isAllowed("bash", "chmod 600 file && ls", CWD), false);
+    assert.equal(list.isAllowed("bash", "chmod 600 file", CWD), true);
+    // Negated pattern: rm rejected, other commands matched.
+    assert.equal(negated.isAllowed("bash", "rm file", CWD), false);
+    assert.equal(negated.isAllowed("bash", "ls -la", CWD), true);
+  } finally {
+    cleanup(dir);
+    cleanup(negatedDir);
+  }
+});
+
+// ── REVIEW B4: full target extraction and realpath containment ────────
+
+test("domain matching handles mixed targets, spaces, links, and cwd", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "smart-approve-domain-"));
+  const domain = path.join(root, "domain");
+  const outside = path.join(root, "outside");
+  fs.mkdirSync(domain);
+  fs.mkdirSync(outside);
+  fs.mkdirSync(path.join(domain, "sub"));
+  fs.writeFileSync(path.join(domain, "my file.txt"), "x");
+  fs.writeFileSync(path.join(outside, "secret"), "x");
+  fs.symlinkSync(path.join(outside, "secret"), path.join(domain, "escape"));
+  const { list, dir } = makeList([
+    {
+      tool: "bash",
+      key: "entry",
+      cwd: CWD,
+      timestamp: "2026-01-01",
+      domain,
+    },
+  ]);
+  try {
+    // Mixed relative + absolute targets, all inside → allowed.
+    assert.equal(
+      list.isAllowed("bash", `cp file1 sub/file2 ${domain}/dest`, domain),
+      true,
+    );
+    // Quoted filename with spaces resolves inside the domain.
+    assert.equal(list.isAllowed("bash", 'chmod 600 "my file.txt"', domain), true);
+    // One target outside the domain rejects the whole command.
+    assert.equal(list.isAllowed("bash", `cp file1 ${outside}/secret ${domain}/d`, domain), false);
+    // In-domain symlink pointing outside fails canonical containment.
+    assert.equal(list.isAllowed("bash", "chmod 600 escape", domain), false);
+    // Same relative command resolves differently per execution cwd.
+    // Unquoted spaces split into two targets, both still in-domain.
+    assert.equal(list.isAllowed("bash", "chmod 600 my file.txt", domain), true);
+    assert.equal(list.isAllowed("bash", "chmod 600 secret", outside), false);
+    // Dynamic targets cannot be proven in-domain → normal approval.
+    assert.equal(list.isAllowed("bash", "chmod 600 $UNKNOWN_VAR/file", domain), false);
+  } finally {
+    cleanup(dir);
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// ── Suggestion: permanent entries persist exact shape ─────────────────
+
+test("rememberPermanent writes exact tool/key/cwd/timestamp entries", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smart-approve-allow-"));
+  const file = path.join(dir, "allow.json");
+  try {
+    const list = new AllowList(file);
+    list.rememberPermanent("bash", "chmod 600 ~/.draft", CWD);
+    const stored = JSON.parse(fs.readFileSync(file, "utf-8"));
+    assert.equal(stored.permanent.length, 1);
+    const entry = stored.permanent[0];
+    assert.deepEqual(Object.keys(entry).sort(), ["cwd", "key", "timestamp", "tool"]);
+    assert.equal(entry.tool, "bash");
+    assert.equal(entry.key, "chmod 600 ~/.draft");
+    assert.equal(entry.cwd, CWD);
+    assert.equal(typeof entry.timestamp, "string");
+  } finally {
+    cleanup(dir);
+  }
+});

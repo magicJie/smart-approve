@@ -82,15 +82,54 @@ function globToRegExp(pattern: string): CompiledPattern {
   return { re: new RegExp(re + "$"), negate };
 }
 
-/** Test a string (typically a normalized command) against a glob pattern. */
 export function matchGlob(pattern: string, value: string): boolean {
   return globToRegExp(pattern).re.test(value);
 }
 
 /**
+ * Test a normalized command against a command glob.
+ * Anchored at both ends. `*`/`?` span arguments but never cross command
+ * separators (`;`, `&`, `|`, newline, subshell/redirect syntax); `**`
+ * spans everything.  A leading `!` negates the match.
+ */
+export function matchCommandGlob(pattern: string, value: string): boolean {
+  let negate = false;
+  let p = pattern.trim();
+  if (p.startsWith("!")) { negate = true; p = p.slice(1); }
+  if (p === "") return false;
+
+  let re = "^";
+  let i = 0;
+  while (i < p.length) {
+    const c = p[i];
+    if (c === "*") {
+      if (p[i + 1] === "*") {
+        re += ".*";
+        i += 2;
+      } else {
+        // Arguments yes, command separators never.
+        re += "[^;&|()<>`\\n]*";
+        i += 1;
+      }
+    } else if (c === "?") {
+      re += "[^;&|()<>`\\n]";
+      i += 1;
+    } else if (".+()[]{}^$|".includes(c)) {
+      re += "\\" + c;
+      i += 1;
+    } else {
+      re += c;
+      i += 1;
+    }
+  }
+  return new RegExp(re + "$").test(value) !== negate;
+}
+
+/**
  * True when `target` resolves inside the user's home or the session cwd —
  * i.e. the paths a user-level task may legitimately modify.  Symlink-aware:
- * every lexical + canonical candidate must land inside a user-writable root.
+ * every lexical + canonical candidate must land inside a user-writable root,
+ * so an in-domain symlink pointing outside still fails.
  * Returns false for empty targets, URLs, and out-of-domain absolute paths.
  */
 export function isUserWritablePath(
@@ -103,7 +142,7 @@ export function isUserWritablePath(
   if (candidates.length === 0) return false;
   const homeCandidates = resolveFilesystemPathCandidates(home, home);
   const sessionCandidates = resolveFilesystemPathCandidates(sessionCwd, sessionCwd);
-  return candidates.some((candidate) =>
+  return candidates.every((candidate) =>
     homeCandidates.some((directory) => isWithinDirectory(candidate, directory)) ||
     sessionCandidates.some((directory) => isWithinDirectory(candidate, directory)),
   );

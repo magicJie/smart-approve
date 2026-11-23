@@ -472,7 +472,7 @@ export class BashToolGate extends ToolGate {
     const analysisCwd = resolveRequestedCwd(requestedCwd, sessionBase);
     const analysis = leadingUnresolved || isUnresolvedCwd(analysisCwd)
       ? analyzeCommand(subject)
-      : analyzeBashOperation(subject, analysisCwd, sessionCwd, ctx.hasUI);
+      : analyzeBashOperation(subject, analysisCwd, sessionCwd, { hasUI: ctx.hasUI });
 
     let hardBlocked = analysis.hardBlocked;
     let denyTier = analysis.denyTier;
@@ -513,12 +513,12 @@ export class BashToolGate extends ToolGate {
         if (!absoluteTarget) continue;
         // Once the relative chain is unknown, an absolute cd can still enter
         // a sensitive directory and must be checked independently.
-        merge(analyzeBashOperation("", resolveCwdCandidate(target, sessionCwd), sessionCwd, ctx.hasUI));
+        merge(analyzeBashOperation("", resolveCwdCandidate(target, sessionCwd), sessionCwd, { hasUI: ctx.hasUI }));
         continue;
       }
       const resolved = resolveCwdCandidate(path.resolve(currentCwd, target), currentCwd);
       // Missing sensitive targets must not downgrade to a generic confirmation.
-      merge(analyzeBashOperation("", resolved, sessionCwd, ctx.hasUI));
+      merge(analyzeBashOperation("", resolved, sessionCwd, { hasUI: ctx.hasUI }));
       if (isUnresolvedCwd(resolved) || !isExistingDirectory(resolved)) {
         chainTrusted = false;
         continue;
