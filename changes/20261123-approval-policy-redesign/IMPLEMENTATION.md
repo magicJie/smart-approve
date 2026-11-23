@@ -320,3 +320,26 @@ $ bun run build       # dist/index.js 220.10 KB
 ```
 
 **偏差**：无。
+
+## 十六、复审修正 R10（对应 REVIEW.md「第十轮终审 · e73c488」Q1–Q3）
+
+复审对象：`e73c488`。Z1c 已关闭；本轮 Q1/Q2/Q3 必修交付。
+
+| 项 | 修正 | 断言 |
+|----|------|------|
+| Q1（正文展开与文件身份） | 新增 `findHeredocSubstitutions`：未引用正文按 heredoc 展开规则扫描（仅 `$(...)`/反引号/转义，无引号语义——`it's` 的撇号是字面文本）；替换体在正文结束位置内联回文本流，随分段遍历自然继承该位置的 cwd（`cd sub` 后 `$(cat f)` 读 sub/f），不再统一入队到初始 cwd | `heredoc bodies expand by heredoc rules, not command-line quotes (Q1)`：撇号不吞替换体（`it's $(rm -rf …)` 仍检出）、替换体目标 cwd 为 `cd sub` 后的目录 |
+| Q2（undeterminable 传到 gate） | `analyzeCommand` 与 `analyzeBashOperation` 对未闭合正文置 `DangerAnalysis.requiresConfirmation`；gate 既有管线据此在 UI 下要求确认、headless 下 no-ui 阻断，不再空记忆直接授权 | `unterminated heredoc propagates undeterminable to the gate (Q2)`（behaviors）+ gate.test.ts 同名用例：交互式 isError 且 delegate=0、headless `{blocked:true,reason:"no-ui"}`、闭合正文正常裁决 |
+| Q3（分隔词引用状态贯通） | 分隔词按完整词读取（`<<'E'OF` ≡ `<<EOF`，不在首个闭引号停）；任一引用形式（单引号/双引号/反斜杠）均置 quoted=true（`<<\EOF` 正文为字面）；队列每条目自带 quoted/dash，多 heredoc 并存各自独立 | `delimiter quoting forms and per-entry quoted state (Q3)`：`<<\EOF` 正文替换体不执行、`<<'E'OF` 混合片段同样字面、同行两个 heredoc 第一个展开第二个为数据（目标只含 `/tmp/first`） |
+
+**复审修正 R10 后验证**：
+
+```
+$ bun run typecheck   # tsc --noEmit → clean
+$ bun test src
+ 270 pass
+ 0 fail
+Ran 270 tests across 14 files.
+$ bun run build       # dist/index.js 220.54 KB
+```
+
+**偏差**：无。
