@@ -1309,3 +1309,45 @@ test("python !-shell tracks cd across segments and merges deny tiers", () => {
   const deny = analyzer.analyze("!git push -f origin main", "python");
   assert.equal(deny.denyTier, true);
 });
+
+// ── REVIEW R4 (终审): launches consume cwd at their source position ───
+
+test("launches before and after chdir are judged with their own cwd", () => {
+  const session = "/tmp";
+  // The SAME spawn text appears twice — before and after chdir("/etc").
+  // Each launch must be analyzed with the cwd in effect at its position.
+  const r = analyzer.analyze(
+    `spawnSync("chmod", ["777", "f"]);\nprocess.chdir("/etc");\nspawnSync("chmod", ["777", "f"]);`,
+    "js",
+    session,
+    session,
+  );
+  assert.ok(
+    r.behaviors.includes("permission-change-system"),
+    `post-chdir launch must see /etc, got: ${r.behaviors.join(",")}`,
+  );
+  assert.equal(r.hardBlocked, true);
+
+  // Appending a later chdir must not rewrite an earlier verdict.
+  const before = analyzer.analyze(
+    `spawnSync("chmod", ["777", "f"]);\nprocess.chdir("/etc");`,
+    "js",
+    session,
+    session,
+  );
+  assert.ok(
+    !before.behaviors.includes("permission-change-system"),
+    `earlier launch must not inherit the later chdir, got: ${before.behaviors.join(",")}`,
+  );
+  assert.equal(before.hardBlocked, false);
+
+  // A launch entirely after the switch still blocks.
+  const after = analyzer.analyze(
+    `process.chdir("/etc");\nspawnSync("chmod", ["777", "f"]);`,
+    "js",
+    session,
+    session,
+  );
+  assert.ok(after.behaviors.includes("permission-change-system"));
+  assert.equal(after.hardBlocked, true);
+});

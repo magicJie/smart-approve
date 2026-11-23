@@ -266,6 +266,11 @@ export interface EvalWriteTargets {
   hostToolTargets?: string[];
 }
 
+interface EvalWriteTargetsInternal extends EvalWriteTargets {
+  /** Sorted by source offset — pairs with cwdPaths for positional analysis. */
+  cwdOperations: Array<{ offset: number; target: string }>;
+}
+
 /** OMP magic syntax belongs to Python cells only. */
 function isPythonLanguage(language?: string): boolean {
   return typeof language === "string" && /^py(?:thon)?\d*(?:\.\d+)*$/i.test(language.trim());
@@ -275,6 +280,8 @@ interface PythonMagicScan {
   codeText: string;
   maskedCode: string;
   commands: string[];
+  /** Source offset of each `commands` entry (parallel array). */
+  commandOffsets: number[];
   spawnIntent: boolean;
   writePaths: string[];
   writeDynamic: boolean;
@@ -314,6 +321,7 @@ function scanPythonMagics(
     codeText: "",
     maskedCode: "",
     commands: [],
+    commandOffsets: [],
     spawnIntent: false,
     writePaths: [],
     writeDynamic: false,
@@ -324,7 +332,9 @@ function scanPythonMagics(
   const executableLines = executable.split("\n");
   const readableLines = withStrings.split("\n");
   const maskedLines = [...executableLines];
-  const codeLines: string[] = [];
+  // Blank-per-line layout keeps codeText offsets aligned with `source`
+  // (every line keeps its length), so spawn positions map to source offsets.
+  const codeLines: string[] = sourceLines.map((line) => " ".repeat(line.length));
   const lineOffsets: number[] = [];
   let runningOffset = 0;
   for (const line of sourceLines) {
@@ -345,7 +355,10 @@ function scanPythonMagics(
       const script = foldShellContinuations(
         sourceLines.slice(index + 1).join("\n"),
       ).trim();
-      if (script) scan.commands.push(script);
+      if (script) {
+        scan.commands.push(script);
+        scan.commandOffsets.push(lineOffsets[index] ?? 0);
+      }
       for (let cursor = index; cursor < executableLines.length; cursor++) maskLine(cursor);
       break;
     }
@@ -398,13 +411,14 @@ function scanPythonMagics(
       if (command) {
         scan.spawnIntent = true;
         scan.commands.push(command);
+        scan.commandOffsets.push(lineOffsets[index] ?? 0);
       }
       maskLine(index);
       index = commandLine;
       continue;
     }
 
-    codeLines.push(readableLines[index] ?? "");
+    codeLines[index] = readableLines[index] ?? "";
   }
 
   scan.codeText = codeLines.join("\n");
@@ -1203,6 +1217,11 @@ function scanMcpNamespaceCalls(
 
 /** Static file-write and host-tool targets from Eval helpers, Python magics, and common file APIs. */
 export function extractEvalWriteTargets(code: string, language?: string): EvalWriteTargets {
+  const { cwdOperations: _ops, ...targets } = collectEvalWriteTargets(code, language);
+  return targets;
+}
+
+function collectEvalWriteTargets(code: string, language?: string): EvalWriteTargetsInternal {
   const source = String(code ?? "");
   const executable = scrub(source, false);
   const withStrings = scrub(source, true);
@@ -1286,6 +1305,7 @@ export function extractEvalWriteTargets(code: string, language?: string): EvalWr
     cwdPaths: cwdOperations.map((operation) => operation.target),
     cwdDynamic,
     ...(hostToolTargets.size > 0 ? { hostToolTargets: [...hostToolTargets] } : {}),
+    cwdOperations,
   };
 }
 
@@ -1449,70 +1469,88 @@ function splitShellSegments(command: string): string[] {
  * first token is the executable the host actually launches.  Non-literal
  * arguments yield no head and therefore no launch hard block.
  */
-function extractSpawnCommandText(code: string, childProcessImport: boolean): string[] {
-  const commands = new Set<string>();
-  const addArgs = (body: string): void => {
+/** A literal launch recognized in the eval code, with its source offset. */
+interface SpawnCommand {
+  command: string;
+  position: number;
+}
+
+/**
+ * Literal command text for recognized spawn APIs.  Shell-string calls yield
+ * their command; argv calls yield their string elements in order, so the
+ * first token is the executable the host actually launches.  Non-literal
+ * arguments yield no head and therefore no launch hard block.
+ * Positions are source offsets — the same command at two positions is two
+ * distinct launches analyzed with their own effective cwd (R4).
+ */
+function extractSpawnCommandText(code: string, childProcessImport: boolean): SpawnCommand[] {
+  const commands: SpawnCommand[] = [];
+  const add = (position: number, text: string): void => {
+    commands.push({ command: text, position });
+  };
+  const addArgs = (position: number, body: string): void => {
     const args = quotedArrayArgs(body);
     // argv arrays keep their argument boundaries — each element is quoted
     // back into shell text so `["printf","a; b"]` stays one argument (R4).
     if (args.length > 0) {
-      commands.add(args.map(quoteShellArgument).join(" "));
+      add(position, args.map(quoteShellArgument).join(" "));
     }
   };
 
-  for (const match of code.matchAll(/Bun\.\$\s*`([^`]*)`/g)) commands.add(match[1]);
-  for (const match of code.matchAll(/Bun\.\$\s*\(\s*(["'])([\s\S]*?)\1/g)) commands.add(match[2]);
+  for (const match of code.matchAll(/Bun\.\$\s*`([^`]*)`/g)) add(match.index, match[1]);
+  for (const match of code.matchAll(/Bun\.\$\s*\(\s*(["'])([\s\S]*?)\1/g)) add(match.index, match[2]);
 
   const shellApis = childProcessImport ? "execSync|exec" : "execSync";
   const shellPattern = new RegExp(
     `(?:subprocess\\.(?:run|call|check_call|check_output|getoutput|getstatusoutput)|os\\.(?:system|popen)|asyncio\\.create_subprocess_(?:exec|shell)|${shellApis}|Popen)\\s*\\(\\s*(["'])([\\s\\S]*?)\\1`,
     "g",
   );
-  for (const match of code.matchAll(shellPattern)) commands.add(match[2]);
+  for (const match of code.matchAll(shellPattern)) add(match.index, match[2]);
 
   for (const match of code.matchAll(
     /(?:Bun\.spawn(?:Sync)?|Bun\.shell|subprocess\.(?:run|call|check_call|check_output|Popen)|asyncio\.create_subprocess_(?:exec|shell)|execFile(?:Sync)?|spawn(?:Sync)?)\s*\(\s*\[([^\]]*)\]/g,
   )) {
-    addArgs(match[1]);
+    addArgs(match.index, match[1]);
   }
 
   for (const match of code.matchAll(
     /(?:execFile(?:Sync)?|spawn(?:Sync)?)\s*\(\s*(["'])([\s\S]*?)\1\s*(?:,\s*\[([^\]]*)\])?/g,
   )) {
-    commands.add([match[2], ...quotedArrayArgs(match[3] ?? "")].map(quoteShellArgument).join(" "));
+    add(match.index, [match[2], ...quotedArrayArgs(match[3] ?? "")].map(quoteShellArgument).join(" "));
   }
 
   for (const match of code.matchAll(
     /(?:^|[^\w$])os\.exec(?:vpe|vp|ve|v)\s*\(\s*(["'])([\s\S]*?)\1\s*(?:,\s*\[([^\]]*)\])?/g,
   )) {
-    commands.add([match[2], ...quotedArrayArgs(match[3] ?? "")].map(quoteShellArgument).join(" "));
+    add(match.index, [match[2], ...quotedArrayArgs(match[3] ?? "")].map(quoteShellArgument).join(" "));
   }
 
   for (const match of code.matchAll(
     /(?:^|[^\w$])os\.exec(?:lpe|lp|le|l)\s*\(\s*(["'])([\s\S]*?)\1([^)]*)/g,
   )) {
-    commands.add([match[2], ...quotedArrayArgs(match[3] ?? "")].map(quoteShellArgument).join(" "));
+    add(match.index, [match[2], ...quotedArrayArgs(match[3] ?? "")].map(quoteShellArgument).join(" "));
   }
 
   for (const match of code.matchAll(
     /(?:^|[^\w$])os\.spawn(?:vpe|vp|ve|v)\s*\(\s*[^,]+,\s*(["'])([\s\S]*?)\1\s*(?:,\s*\[([^\]]*)\])?/g,
   )) {
-    commands.add([match[2], ...quotedArrayArgs(match[3] ?? "")].map(quoteShellArgument).join(" "));
+    add(match.index, [match[2], ...quotedArrayArgs(match[3] ?? "")].map(quoteShellArgument).join(" "));
   }
 
   for (const match of code.matchAll(
     /(?:^|[^\w$])os\.spawn(?:lpe|lp|le|l)\s*\(\s*[^,]+,\s*(["'])([\s\S]*?)\1([^)]*)/g,
   )) {
-    commands.add([match[2], ...quotedArrayArgs(match[3] ?? "")].map(quoteShellArgument).join(" "));
+    add(match.index, [match[2], ...quotedArrayArgs(match[3] ?? "")].map(quoteShellArgument).join(" "));
   }
 
   for (const match of code.matchAll(
     /(?:^|[^\w$])(?:os\.)?posix_spawnp?\s*\(\s*(["'])([\s\S]*?)\1\s*(?:,\s*\[([^\]]*)\])?/g,
   )) {
-    commands.add([match[2], ...quotedArrayArgs(match[3] ?? "")].map(quoteShellArgument).join(" "));
+    add(match.index, [match[2], ...quotedArrayArgs(match[3] ?? "")].map(quoteShellArgument).join(" "));
   }
 
-  return [...commands];
+  commands.sort((a, b) => a.position - b.position);
+  return commands;
 }
 
 // ── Composite analysis ───────────────────────────────────────────────
@@ -1602,25 +1640,13 @@ export class EvalCodeBehaviorAnalyzer {
 
     // Literal cwd operations are resolved in source order against the
     // effective base; the shared helper applies the outside-session-root
-    // exception and compares lexical + canonical candidates.  JS/argv spawns
-    // are analyzed with the cwd in effect at their position (R4).
+    // exception and compares lexical + canonical candidates.  Events are
+    // consumed positionally: a spawn is analyzed with the cwd in effect at
+    // its source offset, and a later chdir can never rewrite an earlier
+    // launch verdict (R4).
+    const { cwdOperations } = collectEvalWriteTargets(source, language);
     let currentCwd = base;
     let sensitiveCwd = false;
-    for (const target of extractEvalWriteTargets(source, language).cwdPaths) {
-      if (isSensitiveWorkingDirectory(target, session, currentCwd)) {
-        sensitiveCwd = true;
-        break;
-      }
-      const candidates = resolveFilesystemPathCandidates(target, currentCwd);
-      if (candidates.length > 0) currentCwd = candidates[candidates.length - 1];
-    }
-
-    // B2: statically recognizable spawn commands go through the full bash
-    // analysis so their own behaviors, hard blocks, headless shutdown
-    // confirmations AND deny-tier verdicts survive the eval hop (privileged-
-    // exec keeps its label for the LLM caution note).  R4: JS spawns use the
-    // effective cwd at their position; `!cmd` shell segments use the cwd
-    // tracked across that magic's own `cd` segments.
     let innerHardBlocked = false;
     let innerRequiresConfirmation = false;
     let innerDenyTier = false;
@@ -1635,51 +1661,85 @@ export class EvalCodeBehaviorAnalyzer {
       if (inner.denyTier) innerDenyTier = true;
       if (inner.behaviors.includes("high-risk-shell-pivot")) shellPivot = true;
     };
-    const codeSpawns = extractSpawnCommandText(codeText, childProcessImport);
-    for (const command of codeSpawns) {
-      mergeInner(analyzeBashOperation(command, currentCwd, session, { hasUI }));
-    }
 
-    // A leading `cd` inside each `!cmd` or `%%bash` segment runs the
-    // following shell operations in that directory even though the runtime
-    // cwd is unchanged.  Track literal segments in order; each magic is
-    // analyzed with the cwd in effect when it starts (R4).
+    const codeSpawns = extractSpawnCommandText(codeText, childProcessImport);
+    const magicLaunches = (pythonScan?.commands ?? []).map((command, index) => ({
+      command,
+      position: pythonScan?.commandOffsets[index] ?? 0,
+      magic: true as const,
+    }));
+    const launches = [
+      ...codeSpawns.map((spawn) => ({ ...spawn, magic: false as const })),
+      ...magicLaunches,
+    ].sort((a, b) => a.position - b.position);
+
+    // A leading `cd` inside a `!cmd` or `%%bash` magic runs the following
+    // shell operations in that directory even though the runtime cwd is
+    // unchanged.  `shellCwd` tracks those transitions across the magic
+    // stream in source order; API-level cwd operations also update it
+    // (spawned shells inherit the process cwd).
     let shellCwd: string | undefined = base;
     let shellSensitiveCwd = false;
     let shellUnresolvedCwd = false;
-    for (const command of pythonScan?.commands ?? []) {
-      if (shellCwd !== undefined) {
-        mergeInner(analyzeBashOperation(command, shellCwd, session, { hasUI }));
+    let cwdCursor = 0;
+    const applyCwdTo = (position: number): void => {
+      while (cwdCursor < cwdOperations.length && cwdOperations[cwdCursor].offset <= position) {
+        const op = cwdOperations[cwdCursor++];
+        if (isSensitiveWorkingDirectory(op.target, session, currentCwd)) {
+          sensitiveCwd = true;
+        }
+        const candidates = resolveFilesystemPathCandidates(op.target, currentCwd);
+        if (candidates.length > 0) {
+          currentCwd = candidates[candidates.length - 1];
+          shellCwd = currentCwd;
+        }
       }
-      for (const segment of splitShellSegments(command)) {
-        const leading = parseLeadingShellCwd(segment);
-        if (leading.unresolved) {
-          shellUnresolvedCwd = true;
-          shellCwd = undefined;
-          continue;
-        }
-        if (leading.target === undefined) continue;
+    };
 
-        const baseForTarget = shellCwd;
-        if (baseForTarget === undefined && !path.isAbsolute(leading.target)) {
-          // A failed or unresolved earlier cd leaves the shell cwd unknown;
-          // relative targets cannot be resolved safely from here.
-          shellUnresolvedCwd = true;
-          continue;
+    for (const launch of launches) {
+      applyCwdTo(launch.position);
+      if (launch.magic) {
+        if (shellCwd !== undefined) {
+          mergeInner(analyzeBashOperation(launch.command, shellCwd, session, { hasUI }));
         }
+        for (const segment of splitShellSegments(launch.command)) {
+          const leading = parseLeadingShellCwd(segment);
+          if (leading.unresolved) {
+            shellUnresolvedCwd = true;
+            shellCwd = undefined;
+            continue;
+          }
+          if (leading.target === undefined) continue;
 
-        const resolved = existingDirectory(leading.target, baseForTarget ?? base);
-        if (!resolved) {
-          shellCwd = undefined;
-          shellUnresolvedCwd = true;
-          continue;
+          const baseForTarget = shellCwd;
+          if (baseForTarget === undefined && !path.isAbsolute(leading.target)) {
+            // A failed or unresolved earlier cd leaves the shell cwd unknown;
+            // relative targets cannot be resolved safely from here.
+            shellUnresolvedCwd = true;
+            continue;
+          }
+
+          const resolved = existingDirectory(leading.target, baseForTarget ?? base);
+          if (!resolved) {
+            shellCwd = undefined;
+            shellUnresolvedCwd = true;
+            continue;
+          }
+          if (isSensitiveWorkingDirectory(leading.target, session, baseForTarget ?? base)) {
+            shellSensitiveCwd = true;
+          }
+          shellCwd = resolved;
         }
-        if (isSensitiveWorkingDirectory(leading.target, session, baseForTarget ?? base)) {
-          shellSensitiveCwd = true;
-        }
-        shellCwd = resolved;
+        continue;
       }
+      // B2: statically recognizable spawn commands go through the full bash
+      // analysis so their own behaviors, hard blocks, headless shutdown
+      // confirmations AND deny-tier verdicts survive the eval hop
+      // (privileged-exec keeps its label for the LLM caution note).
+      mergeInner(analyzeBashOperation(launch.command, currentCwd, session, { hasUI }));
     }
+    // Trailing cwd operations still count toward the sensitive-cwd flag.
+    applyCwdTo(Number.POSITIVE_INFINITY);
     if (sensitiveCwd || shellSensitiveCwd) found.add("eval-sensitive-working-directory");
     if (shellUnresolvedCwd) found.add("eval-unresolved-shell-cwd");
 
