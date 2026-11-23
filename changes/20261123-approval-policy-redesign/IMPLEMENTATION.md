@@ -131,9 +131,9 @@ $ bun run build       # dist/index.js 199.91 KB
 | 组 | 修正 | 断言 |
 |----|------|------|
 | R1 管线相邻 | `pipeStageProgram`：每级取实际执行程序 basename；env/sudo/doas 解包到内层命令头；fetch→interpreter 改为**逐对相邻**扫描（`curl … \| cat \| sh` 不再误判）；xargs 保持其自身身份 | `remote-fetch-exec requires truly adjacent pairs`：wrapped 源（sudo/env/doas）仍硬拒、`cat` 隔开不误伤、尾接 `tee` 同裁决 |
-| R2 目标提取 | `stageFileOptionTargets` + 选项表：`tar/curl/wget/find/sort/git/ssh` 等文件型选项值计入目标（`-o`/`-O`/`-K`/`-F`/`--reference` 等）；非文件选项值跳过；重定向目标逐段计入（`/dev/null` 豁免）；`scp/rsync` 远程操作数正则排除；未知命令有操作数即 `undeterminable` → 普通审批；非 bash 工具需 `looksLikeSinglePath` 才按路径处理（eval 源码不再当路径） | `domain matching handles…` 扩展：含引号、重定向、选项值目标；`curl file.txt` 无输出选项 → 无目标（URL 语义） |
+| R2 目标提取 | `stageFileOptionTargets` + 选项表：`tar/curl/wget/find/sort/git/ssh` 等文件型选项值计入目标（`-o`/`-O`/`-K`/`-F`/`--reference` 等）；非文件选项值跳过；重定向目标逐段计入（`/dev/null` 豁免）；`scp/rsync` 远程操作数正则排除；未知命令有操作数即 `undeterminable` → 普通审批；非 bash 工具需 `looksLikeSinglePath` 才按路径处理（eval 源码不再当路径） | `domain matching handles mixed targets, spaces, links, and cwd`（域内混合目标/含空格/域外链接）；重定向目标断言在 R2/R3 追加（见 §八 复审修正 R3 片 A：`literal tilde and HOME quoting…` 重定向用例、`domain entries see sort/git file targets…`） |
 | R3 路径解析 | `semanticPathCandidates` 按 realpath 逐组件顺序解析，`l/../etc/passwd`（l→/etc）判 /etc 而非词法折叠；缺失尾部保留已解析前缀；`cd` 应用一次：bash gate 新增 `analysisCwd` 钩子传“命令自身 cd 生效前”的 cwd，域提取/`commandFileTargets` 用同一 cwd | gate.test.ts `a leading cd in the bash command is applied once`：`cd l && chmod 777 f`（l→/etc）硬拒、`cd sub && chmod 777 f` 可判放行；`semantic path resolution keeps .. components` |
-| R4 包装/argv | POSIX `-c` 接受组合选项簇（`bash -xc`、`sh -euc`）；ssh 远端 argv 逐元素 `quoteShellArgument` 再 `join(" ")`（远端本就走 shell）；eval 侧 argv 数组同样带引号拼接——`["printf","meeting; reboot"]` 是一个参数；`launchCommands` 以 `currentCwd`（含 `%cd`/`!cd` 转换）分析 JS spawn、`shellCwd`（段内 cd 链）分析 `!cmd`/`os.system`；`innerDenyTier` 并入 `denyTier` | `argv arrays keep argument boundaries`、`python !-shell tracks cd across segments and merges deny tiers`（`!git push -f` denyTier=true） |
+| R4 包装/argv | POSIX `-c` 接受组合选项簇（`bash -xc`、`sh -euc`）；ssh 远端 argv 按命令行 `join(" ")`（远端本就走 shell，不重引整体）；eval 侧 argv 数组逐元素 `quoteShellArgument` 拼接——`["printf","meeting; reboot"]` 是一个参数；`launchCommands` 以 `currentCwd`（含 `%cd`/`!cd` 转换）分析 JS spawn、`shellCwd`（段内 cd 链）分析 `!cmd`/`os.system`；`innerDenyTier` 并入 `denyTier` | `argv arrays keep argument boundaries`、`python !-shell tracks cd across segments and merges deny tiers`（`!git push -f` denyTier=true） |
 | R5 glob 边界 | `matchCommandGlob` 重写：按命令段拆分；`**` 覆盖整个参数（含 `/`）但不跨空白/分隔符、`*`/`?` 不跨 `/`、空白、分隔符；`!pat` 否定按段生效——复合命令中任一段命中即拒 | `command globs reject extra command segments and honor negation`：`chmod **` 不吞多参数、`rm *; ls` 中 `!rm *` 命中 rm 段即拒 |
 | R6 权限操作数 | `PERMISSION_SHORT_OPTIONS_RE` 白名单化（`-w` 等符号模式按操作数处理，不再静默丢弃目标）；`--reference`（GNU/bsd 双形）取参照文件属主：可 stat 且属主/组不同 → 硬拒，不可 stat → 可判未知；`'$HOME'`/`"~"` 单引号/字面不展开（`pathArg.literal` 贯通 cd/dd/权限目标） | `permission operands honor roles, --reference, and literal quoting`：`chmod -w /etc/passwd` 硬拒、`chmod 777 '$HOME'` 可判、`--reference /etc/hostname` 硬拒、缺失参照可判 |
 
@@ -148,6 +148,30 @@ $ bun test src
  0 fail
 Ran 236 tests across 14 files.
 $ bun run build       # dist/index.js 208.87 KB
+```
+
+**偏差**：无。
+
+## 九、复审修正 R3（对应 REVIEW.md 终审五项，DECISION 路径 c）
+
+复审对象：`f400321`。按 DECISION.md 推荐路径 (c) 分四片交付，全部用既有基础设施（`roughTokenize`/`commandAndArgs`/`semanticPathCandidates`/`pathArg.literal`），无外部 parser。
+
+| 片 | 修正 | 断言 |
+|----|------|------|
+| A（R2+R6） | `sort`/`git` 移出 `NON_FILE_COMMANDS`（表项永不可达的路由缺陷）；`fileTargetsOfInvocation` 新增 sort（操作数=输入文件）与 git（仅 `-C`/`--git-dir`/`--work-tree` 值）分支；`redirectionTargets` 返回原始 token，调用处经 `pathArg`/`expandPathTarget` 统一在引号边界展开一次；`resolveFilesystemPathCandidates`/`semanticPathCandidates` 新增 `expandHome:false`，已展开路径不再二次把字面 `~` 解析到 home 根 | `sort and git route their file targets out of the non-file table`（`sort -o out.tsv notes.tsv` → 双目标、`git -C /repo` → 单目标、`git -c` 无目标）；`domain entries see sort/git file targets and reject out-of-domain operands`；`literal tilde and HOME quoting are honored end to end`（`chmod "~"` 可判、`chmod ~` 硬拒、重定向字面量） |
+| B（R3） | `semanticPathCandidates` 移至 `paths.ts` 与 `resolveFilesystemPathCandidates` 并列；`allowlist.ts` 的 `allTargetsWithinDomain`（域自身与各目标）统一改用 realpath 顺序解析 —— 权限、dd、域检查三处共享同一套"保留原始分量"解析 | `domain check resolves .. through symlinks like the filesystem does`：`a/l/../note`（l→/etc）按 realpath 落 `/note` 域外拒绝、`a/self/note` 域内放行 |
+| C（R4） | `extractSpawnCommandText` 返回 `{command, position}[]`（去 Set 去重）；`pythonScan` 记录每条 `!cmd`/`%%bash` 源偏移、`codeText` 逐行占位使偏移对齐 source；`analyze` 把 cwd 操作与全部 launch 按 offset 统一交错消费 —— spawn 取其时点 cwd，后续 chdir 不改写先前裁决 | `launches before and after chdir are judged with their own cwd`：同名 spawn 出现在 chdir 两侧各自裁决、`spawn; chdir` 不受后置切换影响、`chdir; spawn` 正确硬拒 |
+| D（R5） | `matchCommandGlob` 重写：先 `splitCommandSegments` + `commandAndArgs` 分词为程序级单元（含 `|`，env/包装照常跳过），再对各实参值逐一 glob（`*`/`?` 不跨 `/`、`**` 可跨；token 数必须全等）；正向须整条命令恰为一个匹配程序，否定任一程序命中即拒；`roughTokenize`/`unquoteToken` 增加反斜杠转义与双引号内 `\"` 处理，tokenizer 已移至 `paths.ts` 共用（消除 behaviors→paths 循环依赖） | `command globs tokenize arguments…`：`'a file.txt'`/`"a file.txt"`/`a\ file.txt` 三种合法表示同判、`cat *` 不吞 `a b` 双实参、`!cat *` 否定对引号/转义/复合命令均生效 |
+
+**复审修正 R3 后验证**：
+
+```
+$ bun run typecheck   # tsc --noEmit → clean
+$ bun test src
+ 242 pass
+ 0 fail
+Ran 242 tests across 14 files.
+$ bun run build       # dist/index.js 211.76 KB
 ```
 
 **偏差**：无。
