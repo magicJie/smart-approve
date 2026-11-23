@@ -11,7 +11,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AllowEntry } from "./types";
 import { normalize, commandFileTargets } from "./behaviors";
-import { matchCommandGlob, resolveFilesystemPathCandidates } from "./paths";
+import { matchCommandGlob, resolveFilesystemPathCandidates, semanticPathCandidates } from "./paths";
 import type { Logger } from "./logger";
 
 /** Normalize a key for dedup: tool + normalized-content + cwd. */
@@ -101,14 +101,16 @@ export class AllowList {
     cwd: string,
     analysisCwd: string,
   ): boolean {
-    const domain = resolveFilesystemPathCandidates(entry.domain ?? "", entry.cwd);
+    const domain = semanticPathCandidates(entry.domain ?? "", entry.cwd);
     const withinDomain = (candidate: string): boolean =>
       domain.some((directory) =>
         candidate === directory ||
         candidate.startsWith(directory.endsWith("/") ? directory : `${directory}/`),
       );
     const resolvesInside = (target: string, base: string): boolean => {
-      const candidates = resolveFilesystemPathCandidates(target, base);
+      // realpath-ordered resolution, shared with permission/dd checks (R3);
+      // command targets arrive already home-expanded at the quoting boundary.
+      const candidates = semanticPathCandidates(target, base, { expandHome: false });
       return candidates.length > 0 && candidates.every(withinDomain);
     };
 
@@ -123,7 +125,7 @@ export class AllowList {
     const { targets, undeterminable } = commandFileTargets(content, analysisCwd);
     if (undeterminable) return false;
     if (targets.length === 0) {
-      return resolveFilesystemPathCandidates(cwd, cwd).every(withinDomain);
+      return semanticPathCandidates(cwd, cwd).every(withinDomain);
     }
     return targets.every((target) => resolvesInside(target.value, target.cwd));
   }

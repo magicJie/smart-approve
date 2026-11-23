@@ -301,3 +301,29 @@ test("domain entries see sort/git file targets and reject out-of-domain operands
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("domain check resolves .. through symlinks like the filesystem does", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "smart-approve-semdom-"));
+  const domain = path.join(root, "a");
+  try {
+    fs.mkdirSync(domain);
+    fs.writeFileSync(path.join(domain, "note"), "A");
+    fs.writeFileSync(path.join(root, "note"), "B");
+    fs.symlinkSync("/etc", path.join(domain, "l"));
+    const { list } = makeList([
+      { tool: "bash", key: "cat", cwd: domain, timestamp: "t", domain },
+    ]);
+    // Realpath semantics: l → /etc, .. → / — the open file is /note,
+    // OUTSIDE the domain.  Lexical folding would answer a/note (inside).
+    assert.equal(
+      list.isAllowed("bash", "cat l/../note", domain),
+      false,
+      "domain must use realpath-ordered resolution",
+    );
+    // A link staying inside the domain keeps working.
+    fs.symlinkSync(domain, path.join(domain, "self"));
+    assert.equal(list.isAllowed("bash", "cat self/note", domain), true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

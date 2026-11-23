@@ -242,6 +242,49 @@ export function resolveFilesystemPathCandidates(
 }
 
 /**
+ * realpath-semantics resolution: components resolve in order, so a `..`
+ * after a symlinked directory escapes the link target, matching what the
+ * filesystem actually does.  Falls back to the lexical candidate list when
+ * the prefix doesn't exist.
+ */
+export function semanticPathCandidates(
+  target: string,
+  baseCwd: string,
+  options: { expandHome?: boolean } = {},
+): string[] {
+  const lexical = resolveFilesystemPathCandidates(target, baseCwd, options);
+  if (!path.isAbsolute(target) && !path.isAbsolute(baseCwd)) return lexical;
+  const absolute = path.isAbsolute(target) ? target : `${baseCwd}/${target}`;
+  // Original components (pre-`..` folding) so a `..` right after a symlinked
+  // directory escapes the link target — realpath semantics (R3).
+  const parts = absolute.split("/").filter((part) => part !== "" && part !== ".");
+  let current = "/";
+  let resolved = 0; // components of `parts` already folded into `current`
+  for (const part of parts) {
+    if (part === "..") {
+      try {
+        current = fs.realpathSync(path.dirname(current));
+      } catch {
+        current = path.dirname(current);
+      }
+      resolved++;
+      continue;
+    }
+    try {
+      current = fs.realpathSync(`${current}/${part}`);
+      resolved++;
+    } catch {
+      break; // missing tail — the resolved prefix still holds
+    }
+  }
+  if (resolved === 0) return lexical;
+  const semantic = [current, ...parts.slice(resolved)].join("/");
+  const lexicalAbsolute = lexical[0] ?? absolute;
+  return semantic === lexicalAbsolute ? [lexicalAbsolute] : [lexicalAbsolute, semantic];
+}
+
+
+/**
  * Glob matcher for protected paths.
  * Stateless after construction; safe to call concurrently.
  */
