@@ -293,7 +293,19 @@ Config lives at `~/.omp/agent/smart-approve.json` (or `~/.pi/agent/smart-approve
   "contextMaxChars": 3000,
   "analysisTimeoutMs": 30000,
   "rpcIdleTimeoutMs": 600000,
-  "model": "@tiny"
+  "model": "@tiny",
+  "autoAllowBehaviors": [
+    "git-rebase",
+    "git-commit-amend",
+    "git-branch-delete",
+    "git-tag-delete",
+    "git-remote-rm",
+    "git-submodule-deinit",
+    "git-worktree-remove",
+    "git-notes-remove",
+    "git-update-ref-delete",
+    "git-config-global"
+  ]
 }
 ```
 
@@ -313,6 +325,34 @@ The legacy `coverage.hub` key is ignored. `autoFallback` is a legacy key: it is 
 | `analysisTimeoutMs` | `30000` | Chat: timeout per RPC attempt. Native decision: deadline for the whole analysis, including model-header resolution. `0` disables the plugin timeout; provider limits still apply |
 | `rpcIdleTimeoutMs` | `600000` | Idle lifetime of the persistent RPC child in ms; `0` = keep alive until session end |
 | `model` | `@tiny` | Chat role alias/provider/id, or a fully qualified registered Pi classifier / OMP native-judgment model |
+| `autoAllowBehaviors` | `[]` | Behavior ids removed from detection results; commands that only match these pass with no dialog and no LLM call, in both interactive and auto modes |
+
+### Auto-allow behaviors (routine operations)
+
+The behavior tier intentionally casts a wide net: routine operations such as `git rebase`, `git commit --amend`, `git branch -D`, `git tag -d`, `git remote rm`, `git submodule deinit`, `git worktree remove`, `git notes remove`, `git update-ref -d`, and `git config --global` all trigger a review. The exact-match allow-list cannot express "always skip this class of operation", so `autoAllowBehaviors` filters by behavior id instead:
+
+```json
+{
+  "autoAllowBehaviors": ["git-rebase", "git-commit-amend", "git-config-global"]
+}
+```
+
+- Listed ids are removed from the detected set **before** labels, hard-block, and deny tier are computed. A command whose detections are all whitelisted passes through with zero interruption (no dialog, no LLM call).
+- Any behavior not in the list still goes through the normal gate. `git rebase main; rm -rf build` with `git-rebase` whitelisted still hard-blocks on `recursive-force-delete`; `git rebase main; git push --force origin main` still hits deny tier on `git-force-push-protected`.
+- Hard-block ids (for example `high-risk-executable` for `sudo`) can technically be listed too — filtering happens before tier computation, so listing one unblocks it. Only list behaviors you genuinely want to skip.
+- `sensitive-working-directory` is added after this filter and remains an absolute hard block.
+
+Valid ids (the keys of the behavior catalog):
+
+| Area | Behavior ids |
+|---|---|
+| Filesystem | `recursive-force-delete`, `delete-root`, `delete-sys-dir`, `delete-home`, `mv-sys-dir`, `cp-root` |
+| System | `write-sensitive-file`, `write-block-device`, `chmod-sys-dir`, `shutdown-reboot`, `disk-format`, `mount-block-device`, `force-kill`, `dd-write`, `sensitive-file-reference`, `sensitive-working-directory` |
+| Execution | `fork-bomb`, `remote-fetch-exec`, `high-risk-executable`, `interpreter-inline-execution`, `permission-change`, `pkg-global-uninstall` |
+| Git | `git-force-push`, `git-force-push-protected`, `git-push-delete`, `git-push-colon-ref`, `git-hard-reset`, `git-clean`, `git-branch-delete`, `git-tag-delete`, `git-stash-clear`, `git-stash-drop`, `git-reflog-expire`, `git-gc-prune`, `git-filter-branch`, `git-filter-repo`, `git-commit-amend`, `git-rebase`, `git-remote-rm`, `git-submodule-deinit`, `git-worktree-remove`, `git-update-ref-delete`, `git-checkout-discard`, `git-restore-discard`, `git-config-global`, `git-notes-remove` |
+| Containers | `docker-destroy`, `kubectl-delete` |
+
+The example config above lists the recommended routine-ops set; the genuinely destructive ids (`recursive-force-delete`, `git-hard-reset`, `git-clean`, `git-stash-drop`/`git-stash-clear`, `git-force-push*`, `git-push-delete`, `docker-destroy`, `kubectl-delete`, `force-kill`, system-path writes) stay gated.
 
 ## Allow-list (decision memory)
 

@@ -2007,6 +2007,19 @@ const DENY_TIER_BEHAVIORS: Record<string, true> = {
   "dd-block-device": true,
 };
 
+/** Behaviors the user opted to auto-allow via the `autoAllowBehaviors`
+ *  config key.  Configured ids are removed from the detected set before
+ *  labels, hard-block, and deny tier are computed, so a command that only
+ *  matched whitelisted behaviors passes through with zero interruption.
+ *  Populated by configureAutoAllow when config loads. */
+const autoAllowBehaviors = new Set<string>();
+
+/** Replace the auto-allow behavior set. Unknown ids simply never match. */
+export function configureAutoAllow(behaviors: readonly string[]): void {
+  autoAllowBehaviors.clear();
+  for (const behavior of behaviors) autoAllowBehaviors.add(behavior);
+}
+
 /** Normalize shell input without treating `#` inside quotes as a comment. */
 export function normalize(cmd: string): string {
   return stripShellComments(collapseLineContinuations(String(cmd ?? "")))
@@ -2199,7 +2212,7 @@ export function analyzeCommand(cmd: string): DangerAnalysis {
     if (FORK_BOMB_PATTERN.test(syntax)) behaviorSet.add("fork-bomb");
   }
 
-  const behaviors = [...behaviorSet];
+  const behaviors = [...behaviorSet].filter((behavior) => !autoAllowBehaviors.has(behavior));
   const labels = behaviors.map((behavior) => BEHAVIORS[behavior] || makeLabel(behavior, behavior));
   const hardBlocked = behaviors.some((behavior) => behavior in HARD_BLOCK_BEHAVIORS);
   const denyTier =

@@ -7,6 +7,7 @@ import {
   analyzeBashOperation,
   analyzeCommand,
   commandFileTargets,
+  configureAutoAllow,
   isSensitiveWorkingDirectory,
 } from "./behaviors.ts";
 
@@ -1556,3 +1557,75 @@ test("a continuation-open body line at EOF still feeds substitution analysis (P1
   assert.ok(plain.targets.some((t) => t.value === "note"));
   assert.equal(plain.undeterminable, false);
 });
+test("autoAllowBehaviors filters routine-only commands to zero interruption", () => {
+  configureAutoAllow(["git-rebase", "git-commit-amend", "git-config-global"]);
+  try {
+    const result = analyzeCommand("git rebase main");
+    assert.deepEqual(result.behaviors, []);
+    assert.deepEqual(result.labels, []);
+    assert.equal(result.hardBlocked, false);
+    assert.equal(result.denyTier, false);
+
+    assert.deepEqual(analyzeCommand("git commit --amend --no-edit").behaviors, []);
+    assert.deepEqual(analyzeCommand("git config --global user.email dev@example.test").behaviors, []);
+  } finally {
+    configureAutoAllow([]);
+  }
+});
+
+test("autoAllowBehaviors keeps non-whitelisted behaviors in the gate", () => {
+  configureAutoAllow(["git-rebase", "force-kill"]);
+  try {
+    const mixed = analyzeCommand("git rebase main; rm -rf build");
+    assert.deepEqual(mixed.behaviors, ["recursive-force-delete"]);
+    assert.equal(mixed.hardBlocked, true);
+    assert.equal(mixed.denyTier, false);
+
+    const denied = analyzeCommand("git rebase main; git push --force origin main");
+    assert.deepEqual(denied.behaviors, ["git-force-push", "git-force-push-protected"]);
+    assert.equal(denied.hardBlocked, false);
+    assert.equal(denied.denyTier, true);
+
+    const partial = analyzeCommand("kill -9 1234; docker rm box");
+    assert.deepEqual(partial.behaviors, ["docker-destroy"]);
+    assert.equal(partial.hardBlocked, false);
+  } finally {
+    configureAutoAllow([]);
+  }
+});
+
+test("autoAllowBehaviors computes hard-block on the filtered set", () => {
+  configureAutoAllow(["privileged-exec"]); // sudo → privileged-exec (redesign tier split)
+  try {
+    const result = analyzeCommand("sudo id");
+    assert.deepEqual(result.behaviors, []);
+    assert.equal(result.hardBlocked, false);
+    assert.equal(result.denyTier, false);
+  } finally {
+    configureAutoAllow([]);
+  }
+});
+
+test("autoAllowBehaviors applies inside substitutions and find -exec", () => {
+  configureAutoAllow(["git-rebase"]);
+  try {
+    assert.deepEqual(analyzeCommand('echo "$(git rebase main)"').behaviors, []);
+    assert.deepEqual(analyzeCommand("find . -exec git rebase main \\;").behaviors, []);
+  } finally {
+    configureAutoAllow([]);
+  }
+});
+
+test("autoAllowBehaviors does not override sensitive working directories", () => {
+  configureAutoAllow(["sensitive-working-directory"]);
+  try {
+    const result = analyzeBashOperation("", "/etc", "/home/user/project");
+    // Domain-level flag bypasses autoAllow; under the redesign it is
+    // reviewable, not hard-blocked (DESIGN §3.1).
+    assert.ok(result.behaviors.includes("sensitive-working-directory"));
+    assert.equal(result.hardBlocked, false);
+  } finally {
+    configureAutoAllow([]);
+  }
+});
+
