@@ -519,3 +519,20 @@ $ bun run build       # dist/index.js 226.17 KB
 ```
 
 **偏差**：无。
+
+## 二十五、收尾记录（第十九轮终审 PASS）
+
+第十九轮 codex 终审 **PASS，无必修项**。唯一的非阻断建议已落实（commit `3faa31b`）：`a continuation-open body line at EOF still feeds substitution analysis (P1)` 用例参数化，同一组断言覆盖「反斜杠在 EOF」与「反斜杠+真实换行」两种输入。
+
+**最终验证**：
+
+```
+$ bun run typecheck   # tsc --noEmit → clean
+$ bun test src
+ 285 pass
+ 0 fail
+Ran 285 tests across 14 files.
+$ bun run build       # dist/index.js 226.17 KB
+```
+
+**偏差**：无。
