@@ -1391,3 +1391,34 @@ test("heredoc-free input keeps whole-text multi-line semantics (S2)", () => {
   assert.ok(mixed.targets.some((t) => t.value === "multi\nline"),
     `multi-line quoted filename survives: ${JSON.stringify(mixed.targets)}`);
 });
+
+test("single-line and continued parenthesized forms agree exactly (T1)", () => {
+  const single = commandFileTargets("( cat <<EOF\n$(cat note)\nEOF\n )\n", "/tmp");
+  const continued = commandFileTargets("( \\\n cat <<EOF\n$(cat note)\nEOF\n )\n", "/tmp");
+  assert.deepEqual(continued.targets, single.targets,
+    "continuation form must bind the same segment");
+  assert.equal(continued.undeterminable, single.undeterminable);
+  assert.ok(single.targets.some((t) => t.value === "note"));
+});
+
+test("comment backslash, escaped backslash, and quoted apostrophe follow bash (T2)", () => {
+  // A comment ending in `\` ends at the newline — the next line RUNS.
+  const c1 = commandFileTargets("cat note # comment \\\ncat other\n", "/tmp");
+  const v1 = c1.targets.map((t) => t.value);
+  assert.ok(v1.includes("note") && v1.includes("other"),
+    `next line after comment must execute: ${v1}`);
+  // A trailing `\\` is a literal backslash + real newline, not a
+  // continuation — the next line is still a command.
+  const c2 = commandFileTargets("cat note\\\\\ncat other\n", "/tmp");
+  assert.ok(c2.targets.map((t) => t.value).includes("other"),
+    "escaped backslash must not join the next line");
+  // An apostrophe inside double quotes must not flip single-quote state;
+  // the continuation inside the quotes still collapses.
+  const c3 = commandFileTargets('cat "it\'s \\\nnote"', "/tmp");
+  assert.deepEqual(c3.targets.map((t) => t.value), ["it's note"]);
+  // Behavior labels agree between continued and plain forms.
+  assert.deepEqual(
+    analyzeCommand("printf a \\\n| sh").behaviors,
+    analyzeCommand("printf a | sh").behaviors,
+  );
+});

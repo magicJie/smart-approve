@@ -776,6 +776,57 @@ function findHeredocSubstitutions(body: string): string[] {
   return result;
 }
 
+/** Collapse bash line continuations with ONE lexical state machine (T2):
+ *  a `\`+newline pair is removed only OUTSIDE single quotes, OUTSIDE
+ *  comments, and only when the backslash is not itself escaped.  So a
+ *  comment's trailing backslash does NOT join the next line into the
+ *  comment, a trailing `\\` is a literal backslash + real newline, and an
+ *  apostrophe inside double quotes never flips the single-quote state. */
+function collapseLineContinuations(input: string): string {
+  let out = "";
+  let quote: "'" | "\"" | undefined;
+  let comment = false;
+  for (let i = 0; i < input.length; i++) {
+    const c = input[i];
+    if (comment) {
+      out += c;
+      if (c === "\n") comment = false; // comment ends at the real newline
+      continue;
+    }
+    if (quote === "'") {
+      out += c;
+      if (c === "'") quote = undefined;
+      continue;
+    }
+    if (quote === "\"") {
+      if (c === "\\") {
+        if (input[i + 1] === "\n") { i++; continue; } // continuation
+        out += c + (input[i + 1] ?? ""); // keep escaped char (incl. \")
+        i++;
+        continue;
+      }
+      out += c;
+      if (c === "\"") quote = undefined;
+      continue;
+    }
+    if (c === "\\") {
+      if (input[i + 1] === "\n") { i++; continue; } // continuation
+      out += c + (input[i + 1] ?? ""); // \\ and \' stay literal pairs
+      i++;
+      continue;
+    }
+    if (c === "'") { quote = "'"; out += c; continue; }
+    if (c === "\"") { quote = "\""; out += c; continue; }
+    if (c === "#" && (i === 0 || /[\s;|&(]/.test(input[i - 1]))) {
+      comment = true;
+      out += c;
+      continue;
+    }
+    out += c;
+  }
+  return out;
+}
+
 /** One logical command of heredoc-preprocessed work.  `expansions` attaches
  *  each unquoted heredoc body's command substitutions to the GROUP INDEX of
  *  the segment that owns the redirection — the walker analyzes each
@@ -801,7 +852,9 @@ interface HeredocWork {
  *  unterminated heredoc sets `unterminated` (Q2).  A trailing empty
  *  fragment from `split("\n")` is NOT a real blank line (N1). */
 function splitHeredocWork(command: string): HeredocWork {
-  const lines = command.split("\n");
+  // T1: collapse continuations with the same state machine normalize uses,
+  // so the pre-scan and the consumer see identical segment content.
+  const lines = collapseLineContinuations(command).split("\n");
   if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
   const items: HeredocWorkItem[] = [];
   const delimiters: {
@@ -1909,22 +1962,7 @@ const DENY_TIER_BEHAVIORS: Record<string, true> = {
 
 /** Normalize shell input without treating `#` inside quotes as a comment. */
 export function normalize(cmd: string): string {
-  // Collapse bash line continuations (`\`+newline) BEFORE any tokenizing —
-  // `cat no\<newline>te` is the single operand `note`.  Inside single
-  // quotes the backslash-newline pair is literal and stays.
-  const input = String(cmd ?? "");
-  let collapsed = "";
-  let singleQuoted = false;
-  for (let i = 0; i < input.length; i++) {
-    const c = input[i];
-    if (c === "'") singleQuoted = !singleQuoted;
-    if (c === "\\" && input[i + 1] === "\n" && !singleQuoted) {
-      i++; // drop both characters — line continuation
-      continue;
-    }
-    collapsed += c;
-  }
-  return stripShellComments(collapsed)
+  return stripShellComments(collapseLineContinuations(String(cmd ?? "")))
     .replace(/[ \t\r]+/g, " ")
     .replace(/\n{2,}/g, "\n")
     .trim();
