@@ -455,3 +455,25 @@ $ bun run build       # dist/index.js 225.35 KB
 ```
 
 **偏差**：无。
+
+## 二十二、复审修正 R16（对应 REVIEW.md「第十六轮终审 · e23ce3d」K1/K2）
+
+复审对象：`e23ce3d`。U1/U2 已关闭；本轮 K1 必修 + K2（非阻断）交付。
+
+| 项 | 修正 | 断言 |
+|----|------|------|
+| K1（声明命令结束后才消费正文） | 分隔词先入 `pendingDeclarations`，仅当声明命令到达有效换行（引号闭合且无续行）才转入正文消费队列——声明行的续行参数先拼回声明；EOF 时未入队的 pending 声明同样计为未闭合 | `continued declaration lines join their operands before the body starts (K1)`：`cat <<EOF \` + `note` 与单行 `cat <<EOF note` 目标集/完整性完全一致（`note` 是 cat 操作数而非正文）；U1 三组对照保持通过 |
+| K2（未引用正文结束行折叠） | 正文消费按分隔词引用属性区分：未引用正文行末反斜杠与下一行拼接后再比分隔词（拼接行上的分隔词是正文而非结束词）；引用正文保持字面比较 | `unquoted bodies fold continuations before the delimiter check (K2)`：未引用 `abc\`+`EOF` 拼接后继续正文（无第二次 EOF 判未闭合、不虚构命令；有第二次 EOF 正常闭合且 `after` 计入）；引用正文首个 `EOF` 即闭合、`after` 计入 |
+
+**复审修正 R16 后验证**：
+
+```
+$ bun run typecheck   # tsc --noEmit → clean
+$ bun test src
+ 283 pass
+ 0 fail
+Ran 283 tests across 14 files.
+$ bun run build       # dist/index.js 225.78 KB
+```
+
+**偏差**：无。
