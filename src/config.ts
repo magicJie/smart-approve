@@ -9,6 +9,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as os from "node:os";
+import { configureAutoAllow } from "./behaviors";
 import type { LoggerLike } from "./logger";
 import { DEFAULT_PROTECTED_PATHS } from "./paths";
 
@@ -47,6 +48,9 @@ export interface SmartApproveConfig {
   /** Chat role alias/provider/id, or an exact provider/model-id registered as
    *  a Pi classifier or OMP native judgment model. Default @tiny. */
   model: string;
+  /** Behavior ids removed from detection results so commands that only
+   *  match these routine operations pass without dialog or LLM review. */
+  autoAllowBehaviors: string[];
 }
 
 const DEFAULT_CONFIG: SmartApproveConfig = {
@@ -63,6 +67,7 @@ const DEFAULT_CONFIG: SmartApproveConfig = {
   analysisTimeoutMs: 30_000,
   rpcIdleTimeoutMs: 600_000,
   model: "@tiny",
+  autoAllowBehaviors: [],
 };
 
 /** Deep-merge user config over defaults (arrays replaced, not concatenated). */
@@ -96,6 +101,9 @@ function mergeConfig(user: unknown): SmartApproveConfig {
       ? u.rpcIdleTimeoutMs
       : DEFAULT_CONFIG.rpcIdleTimeoutMs,
     model: typeof u.model === "string" && u.model.trim() ? u.model.trim() : DEFAULT_CONFIG.model,
+    autoAllowBehaviors: Array.isArray(u.autoAllowBehaviors)
+      ? u.autoAllowBehaviors.filter((x): x is string => typeof x === "string")
+      : DEFAULT_CONFIG.autoAllowBehaviors,
   };
 }
 
@@ -134,6 +142,12 @@ export class ConfigStore {
   }
 
   private load(): SmartApproveConfig {
+    const config = this.loadMerged();
+    configureAutoAllow(config.autoAllowBehaviors);
+    return config;
+  }
+
+  private loadMerged(): SmartApproveConfig {
     try {
       if (fs.existsSync(this.configPath)) {
         const raw = fs.readFileSync(this.configPath, "utf-8");
