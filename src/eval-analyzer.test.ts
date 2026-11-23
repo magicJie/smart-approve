@@ -591,7 +591,7 @@ test("shutdown and reboot commands stay reviewable but keep their behavior", () 
 });
 
 test("headless shutdown via eval requires confirmation", () => {
-  const r = analyzer.analyze("Bun.$\`shutdown -h now\`;", "js", "/work/project", "/work/project", false);
+  const r = analyzer.analyze("Bun.$\`shutdown -h now\`;", "js", "/work/project", "/work/project", undefined, false);
   assert.deepEqual(r.behaviors, [SPAWN, "shutdown-reboot"]);
   assert.equal(r.hardBlocked, false);
   assert.equal(r.requiresConfirmation, true, "headless eval shutdown auto-rejects");

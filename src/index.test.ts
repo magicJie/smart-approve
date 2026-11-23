@@ -551,7 +551,7 @@ test("auto mode protected-path review asks with UI and blocks without UI", async
   });
 });
 
-test("auto mode protected-path review blocks headless when no verdict exists", async () => {
+test("auto mode protected-path review blocks headless without a model verdict", async () => {
   await withTemporaryHome(async (home) => {
     fs.writeFileSync(
       path.join(home, ".omp", "agent", "smart-approve.json"),
@@ -572,7 +572,9 @@ test("auto mode protected-path review blocks headless when no verdict exists", a
       ctx,
     );
     if (!isBlocked(blocked)) assert.fail("expected headless protected-path write to be blocked");
-    assert.match(blocked.reason, /no usable model verdict|没有给出有效判断/i);
+    // Protected-path writes always need a human; headless blocks before any
+    // model verdict is considered (local redesign requiresConfirmation).
+    assert.match(blocked.reason, /no UI|需要审查/);
   });
 });
 

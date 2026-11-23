@@ -621,32 +621,36 @@ test("eval: exact Task Group pool-cancel write delegates without review", async 
   assert.equal(h.calls.delegate, 1);
 });
 
-test("eval: Task Group-looking extra properties go through the model", async () => {
+test("eval: Task Group-looking extra properties require review", async () => {
   const code = `
 const TG_GROUP = "tgabc";
 const TG_PROTOCOL = "omp-task-group/eval-result-v1";
 await tool.write({ path: "proc://" + TG_GROUP + "/kill", content: "extra" });
 `;
-  const allowed = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
+  // Dynamic write target: human review with model evidence, then delegate.
+  const allowed = makeHarness();
   const allowedResult = await run(EvalToolGate, allowed, { language: "js", code });
   assert.equal(allowedResult.content[0].text, "native-run");
   assert.equal(allowed.calls.analyze, 1);
   assert.equal(allowed.calls.delegate, 1);
 
+  // Headless: a dynamically targeted write needs a human, so it blocks
+  // before any model call regardless of the verdict.
   const noVerdict = makeHarness(
     { mode: "auto", autoInHeadless: true },
     { hasUI: false, analyzeResult: null },
   );
   const blocked = await run(EvalToolGate, noVerdict, { language: "js", code });
   assert.equal(blocked.isError, true);
-  assert.equal(reasonOf(blocked), "no-verdict");
-  assert.equal(noVerdict.calls.analyze, 1);
+  assert.equal(reasonOf(blocked), "no-ui");
+  assert.equal(noVerdict.calls.analyze, 0);
   assert.equal(noVerdict.calls.delegate, 0);
 });
 
-test("eval: object write to a protected path goes through the model", async () => {
+test("eval: object write to a protected path requires human review", async () => {
   const code = 'await tool.write({ path: ".env" })';
-  const allowed = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
+  const allowed = makeHarness();
+  allowed.selectResult = allowed.deps.t.sessionAllow;
   const allowedResult = await run(EvalToolGate, allowed, { language: "js", code });
   assert.equal(allowedResult.content[0].text, "native-run");
   assert.equal(allowed.calls.analyze, 1);
@@ -658,8 +662,8 @@ test("eval: object write to a protected path goes through the model", async () =
   );
   const blocked = await run(EvalToolGate, noVerdict, { language: "js", code });
   assert.equal(blocked.isError, true);
-  assert.equal(reasonOf(blocked), "no-verdict");
-  assert.equal(noVerdict.calls.analyze, 1);
+  assert.equal(reasonOf(blocked), "no-ui");
+  assert.equal(noVerdict.calls.analyze, 0);
   assert.equal(noVerdict.calls.delegate, 0);
 });
 
@@ -729,7 +733,8 @@ test("eval: direct MCP calls cannot be auto-allowed without a model verdict", as
     code: "await tool.mcp__ssh_manager_ssh_execute({'server':'x','command':'id'})",
   });
   assert.equal(r.isError, true);
-  assert.equal(reasonOf(r), "no-verdict");
+  // Statically identified MCP call: deny-tier fail-closed with no verdict.
+  assert.equal(reasonOf(r), "deny-tier");
   assert.equal(h.calls.analyze, 1);
   assert.equal(h.calls.delegate, 0);
 });
@@ -754,9 +759,9 @@ test("eval: MCP namespace calls use the live host tool inventory", async () => {
   assert.equal(h.calls.delegate, 1);
 });
 
-test("eval: dynamic host-tool dispatch goes through the model", async () => {
+test("eval: dynamic host-tool dispatch requires human review", async () => {
   const code = "await tool[name]({})";
-  const allowed = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
+  const allowed = makeHarness();
   const allowedResult = await run(EvalToolGate, allowed, { language: "js", code });
   assert.equal(allowedResult.content[0].text, "native-run");
   assert.equal(allowed.calls.analyze, 1);
@@ -768,8 +773,8 @@ test("eval: dynamic host-tool dispatch goes through the model", async () => {
   );
   const blocked = await run(EvalToolGate, noVerdict, { language: "js", code });
   assert.equal(blocked.isError, true);
-  assert.equal(reasonOf(blocked), "no-verdict");
-  assert.equal(noVerdict.calls.analyze, 1);
+  assert.equal(reasonOf(blocked), "no-ui");
+  assert.equal(noVerdict.calls.analyze, 0);
   assert.equal(noVerdict.calls.delegate, 0);
 });
 
@@ -798,7 +803,7 @@ test("eval: xd host-tool writes cannot be auto-allowed without a model verdict",
     code: "await tool.write({path:'xd://mcp__x',content:'{}'})",
   });
   assert.equal(r.isError, true);
-  assert.equal(reasonOf(r), "no-verdict");
+  assert.equal(reasonOf(r), "deny-tier");
   assert.equal(h.calls.analyze, 1);
   assert.equal(h.calls.delegate, 0);
 });
@@ -820,11 +825,13 @@ test("eval: template-interpolated content cannot hide a protected write", async 
     "await tool.write({path:'notes.md',content:hidden})";
 
   const auto = makeHarness({ mode: "auto" });
+  // Protected write: even auto mode asks the human (model is evidence only).
+  auto.selectResult = auto.deps.t.sessionAllow;
   const automatic = await run(EvalToolGate, auto, { language: "js", code });
   assert.equal(automatic.content[0].text, "native-run");
   assert.equal(auto.calls.delegate, 1);
   assert.equal(auto.calls.analyze, 1);
-  assert.equal(auto.selectChoices, null);
+  assert.equal(auto.selectChoices?.length, 1);
 
   const interactive = makeHarness();
   interactive.selectResult = "Allow for this session";
@@ -843,14 +850,15 @@ test("eval: template-interpolated content cannot hide a protected write", async 
     code: "await tool.write({path:'notes.md',content:`${write(target, secret)}`})",
   });
   assert.equal(blocked.isError, true);
-  assert.equal(reasonOf(blocked), "no-verdict");
-  assert.equal(noUI.calls.analyze, 1);
+  assert.equal(reasonOf(blocked), "no-ui");
+  assert.equal(noUI.calls.analyze, 0);
   assert.equal(noUI.calls.delegate, 0);
 });
 
 test("eval: object tool.write file targets still apply protected-path checks", async () => {
   const code = 'await tool.write({ "path": ".env", "content": "secret" })';
-  const h = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
+  const h = makeHarness();
+  h.selectResult = h.deps.t.sessionAllow;
   const r = await run(EvalToolGate, h, { language: "js", code });
   assert.equal(r.content[0].text, "native-run");
   assert.equal(h.calls.analyze, 1);
@@ -862,14 +870,15 @@ test("eval: object tool.write file targets still apply protected-path checks", a
   );
   const blocked = await run(EvalToolGate, noVerdict, { language: "js", code });
   assert.equal(blocked.isError, true);
-  assert.equal(reasonOf(blocked), "no-verdict");
+  assert.equal(reasonOf(blocked), "no-ui");
   assert.match(blocked.content[0].text, /protected file/i);
-  assert.equal(noVerdict.calls.analyze, 1);
+  assert.equal(noVerdict.calls.analyze, 0);
   assert.equal(noVerdict.calls.delegate, 0);
 });
 
-test("eval: direct protected write helper is auto-decided by a valid model verdict", async () => {
+test("eval: direct protected write helper requires confirmation despite a valid model verdict", async () => {
   const h = makeHarness({ mode: "auto" });
+  h.selectResult = h.deps.t.sessionAllow;
   const r = await run(EvalToolGate, h, {
     language: "js",
     code: 'await write(".env", "secret")',
@@ -877,24 +886,28 @@ test("eval: direct protected write helper is auto-decided by a valid model verdi
   assert.equal(r.content[0].text, "native-run");
   assert.equal(h.calls.analyze, 1);
   assert.equal(h.calls.delegate, 1);
-  assert.equal(h.selectChoices, null);
+  assert.equal(h.selectChoices?.length, 1);
 });
 
-test("eval protected writes honor a remembered approval", async () => {
+test("eval protected writes do not honor a remembered approval", async () => {
+  // Protected writes always need a human decision; a remembered entry must
+  // not short-circuit the review (local redesign: allow-list is gated on
+  // !requiresConfirmation).
   const h = makeHarness({ mode: "auto" }, { isAllowed: true });
+  h.selectResult = h.deps.t.sessionAllow;
   const r = await run(EvalToolGate, h, {
     language: "js",
     code: 'await write(".env", "secret")',
   });
   assert.equal(r.content[0].text, "native-run");
-  assert.equal(h.calls.analyze, 0);
+  assert.equal(h.calls.analyze, 1);
   assert.equal(h.calls.delegate, 1);
-  assert.equal(h.selectChoices, null);
+  assert.equal(h.selectChoices?.length, 1);
 });
 
-test("eval computed file-write targets go through the model in auto mode", async () => {
+test("eval computed file-write targets require human review", async () => {
   const code = "await Bun.write(target, content)";
-  const h = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
+  const h = makeHarness();
   const r = await run(EvalToolGate, h, { language: "js", code });
   assert.equal(r.content[0].text, "native-run");
   assert.equal(h.calls.analyze, 1);
@@ -906,8 +919,8 @@ test("eval computed file-write targets go through the model in auto mode", async
   );
   const blocked = await run(EvalToolGate, noVerdict, { language: "js", code });
   assert.equal(blocked.isError, true);
-  assert.equal(reasonOf(blocked), "no-verdict");
-  assert.equal(noVerdict.calls.analyze, 1);
+  assert.equal(reasonOf(blocked), "no-ui");
+  assert.equal(noVerdict.calls.analyze, 0);
   assert.equal(noVerdict.calls.delegate, 0);
 });
 
@@ -1019,8 +1032,8 @@ test("eval: relative writes after a dynamic directory change go through the mode
   );
   const blocked = await run(EvalToolGate, noVerdict, { language: "js", code });
   assert.equal(blocked.isError, true);
-  assert.equal(reasonOf(blocked), "no-verdict");
-  assert.equal(noVerdict.calls.analyze, 1);
+  assert.equal(reasonOf(blocked), "no-ui");
+  assert.equal(noVerdict.calls.analyze, 0);
   assert.equal(noVerdict.calls.delegate, 0);
 });
 test("eval gates Python shell magics and writefile targets", async () => {
@@ -1043,7 +1056,8 @@ test("eval gates Python shell magics and writefile targets", async () => {
   assert.equal(deniedResult.isError, true);
   assert.equal(deniedShell.calls.delegate, 0);
 
-  const protectedWrite = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
+  const protectedWrite = makeHarness();
+  protectedWrite.selectResult = protectedWrite.deps.t.sessionAllow;
   const allowedWrite = await run(EvalToolGate, protectedWrite, {
     language: "py",
     code: "%%writefile .env\nsecret",
@@ -1061,8 +1075,8 @@ test("eval gates Python shell magics and writefile targets", async () => {
     code: "%%writefile .env\nsecret",
   });
   assert.equal(blockedWrite.isError, true);
-  assert.equal(reasonOf(blockedWrite), "no-verdict");
-  assert.equal(noVerdict.calls.analyze, 1);
+  assert.equal(reasonOf(blockedWrite), "no-ui");
+  assert.equal(noVerdict.calls.analyze, 0);
   assert.equal(noVerdict.calls.delegate, 0);
 
   const systemWrite = makeHarness();
@@ -1084,8 +1098,8 @@ test("eval gates Python shell magics and writefile targets", async () => {
   assert.equal(sensitiveCwd.calls.delegate, 0);
 });
 
-test("eval external Python source and unresolved proc cwd go through the model", async () => {
-  const externalSource = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
+test("eval external Python source and unresolved proc cwd require human review", async () => {
+  const externalSource = makeHarness();
   const allowedSource = await run(EvalToolGate, externalSource, {
     language: "py",
     code: "%run script.py",
@@ -1103,8 +1117,8 @@ test("eval external Python source and unresolved proc cwd go through the model",
     code: "%run script.py",
   });
   assert.equal(blockedSource.isError, true);
-  assert.equal(reasonOf(blockedSource), "no-verdict");
-  assert.equal(sourceNoVerdict.calls.analyze, 1);
+  assert.equal(reasonOf(blockedSource), "no-ui");
+  assert.equal(sourceNoVerdict.calls.analyze, 0);
   assert.equal(sourceNoVerdict.calls.delegate, 0);
 
   const unknownCwdWrite = makeHarness(
@@ -1117,8 +1131,8 @@ test("eval external Python source and unresolved proc cwd go through the model",
     cwd: UNRESOLVED_CWD,
   });
   assert.equal(blockedWrite.isError, true);
-  assert.equal(reasonOf(blockedWrite), "no-verdict");
-  assert.equal(unknownCwdWrite.calls.analyze, 1);
+  assert.equal(reasonOf(blockedWrite), "no-ui");
+  assert.equal(unknownCwdWrite.calls.analyze, 0);
   assert.equal(unknownCwdWrite.calls.delegate, 0);
 
   const unknownCwdSpawn = makeHarness(
@@ -1131,8 +1145,8 @@ test("eval external Python source and unresolved proc cwd go through the model",
     cwd: UNRESOLVED_CWD,
   });
   assert.equal(blockedSpawn.isError, true);
-  assert.equal(reasonOf(blockedSpawn), "no-verdict");
-  assert.equal(unknownCwdSpawn.calls.analyze, 1);
+  assert.equal(reasonOf(blockedSpawn), "no-ui");
+  assert.equal(unknownCwdSpawn.calls.analyze, 0);
   assert.equal(unknownCwdSpawn.calls.delegate, 0);
 });
 
