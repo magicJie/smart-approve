@@ -297,3 +297,26 @@ $ bun run build       # dist/index.js 218.94 KB
 ```
 
 **偏差**：无。
+
+## 十五、复审修正 R9（对应 REVIEW.md「第九轮终审 · 62eaa73」Z1a/Z1b/Z1c）
+
+复审对象：`62eaa73`。Z2/Z3 已关闭；本轮 Z1a/Z1b 必修 + Z1c（非阻断）交付。
+
+| 项 | 修正 | 断言 |
+|----|------|------|
+| Z1a（分隔词按去引用词值匹配） | 扫描器先捕获分隔词原文（含引号/反斜杠），入队时存 `evaluateShellWord` 求值后的词值：`<<\EOF` 与 `<<EOF` 同样以 `EOF` 行结束；`<<'E\OF'` 保留字面反斜杠；`quoted` 属性保留 | `heredoc delimiters match by evaluated word value (Z1a)`：`<<\EOF` 正文正确终止且后续 `sort after.tsv` 计入、非 undeterminable；`<<'E\OF'` 按字面词结束、后续 `sort real.tsv` 计入 |
+| Z1b（正文展开语义传入审批） | `stripHeredocBodies` 返回 `{text, substitutionBodies, unterminated}`：未引用分隔词的正文用 `findShellSubstitutions` 提取 `$(...)`/反引号替换体，作为真实命令重新入 `analyzeCommand`、`analyzeBashOperation`、`commandFileTargets` 的分析队列；引用分隔词正文仍为纯数据；未闭合 heredoc 置 unterminated → 域检查 undeterminable | `unquoted heredoc bodies execute their substitutions; quoted stay data (Z1b)`：未引用正文 `$(rm -rf /tmp/x)` 与反引号均产生 recursive-force-delete、引用正文同文本不产生、正文后 `sort after.tsv` 仍计入且替换载荷使域检查 undeterminable、未闭合正文 undeterminable |
+| Z1c（fd 数值与输入方向） | fd 比较按数值（`01` ≡ `1`，合法合并写）；`<&file.txt` 无合并写形式——不记写目标，标 undeterminable | `fd numbers compare by value; input dup of a file is invalid (Z1c)`：`01>&file.txt` 计入目标且非 undeterminable、`cat <&file.txt` 无目标且 undeterminable |
+
+**复审修正 R9 后验证**：
+
+```
+$ bun run typecheck   # tsc --noEmit → clean
+$ bun test src
+ 266 pass
+ 0 fail
+Ran 266 tests across 14 files.
+$ bun run build       # dist/index.js 220.10 KB
+```
+
+**偏差**：无。
