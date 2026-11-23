@@ -1092,3 +1092,55 @@ test("escaped tilde plus variable tail stays undeterminable (Y3)", () => {
     assert.deepEqual(r.targets, [], `${form} must not yield a fabricated path`);
   }
 });
+
+test("heredoc markers only count at shell syntax positions (Z1)", () => {
+  // A `<<EOF` inside quotes is text — the next line is a real command.
+  const quoted = commandFileTargets(
+    'echo "see <<EOF"\nsort real.tsv\n',
+    "/tmp",
+  );
+  assert.deepEqual(quoted.targets.map((t) => t.value), ["real.tsv"],
+    "quoted <<EOF must not queue a body");
+  // Same for a comment.
+  const commented = commandFileTargets(
+    "# cat <<EOF\nsort notes.tsv\n",
+    "/tmp",
+  );
+  assert.deepEqual(commented.targets.map((t) => t.value), ["notes.tsv"],
+    "commented <<EOF must not queue a body");
+  // A real heredoc still strips its body and resumes afterwards.
+  const real = commandFileTargets(
+    "cat <<EOF\nrm -rf /\nEOF\nsort after.tsv\n",
+    "/tmp",
+  );
+  assert.deepEqual(real.targets.map((t) => t.value), ["after.tsv"]);
+});
+
+test("write protection shares the domain check's evaluated operand (Z2)", () => {
+  // All three spellings name /proc/sysrq-trigger — for the domain targets
+  // AND for write-sensitive-file alike.
+  for (const form of [">/proc/sysrq-trigger", '>"/proc/sysrq-trigger"', '>"/proc"/sysrq-trigger']) {
+    const targets = commandFileTargets(`echo 1 ${form}`, "/tmp");
+    assert.deepEqual(targets.targets.map((t) => t.value), ["/proc/sysrq-trigger"], form);
+    const analysis = analyzeBashOperation(`echo 1 ${form}`, "/tmp", "/tmp");
+    assert.ok(analysis.behaviors.includes("write-sensitive-file"), form);
+  }
+  // The read spelling never trips write protection in any quoting form.
+  assert.ok(!analyzeBashOperation('cat <"/proc"/uptime', "/tmp", "/tmp")
+    .behaviors.includes("write-sensitive-file"));
+});
+
+test("left descriptor value decides combined-write validity (Z3)", () => {
+  // Implicit stdout and explicit 1 are legal combined writes.
+  for (const form of [">&file.txt", "1>&file.txt"]) {
+    const r = commandFileTargets(`echo hi ${form}`, "/tmp");
+    assert.deepEqual(r.targets.map((t) => t.value), ["file.txt"], form);
+    assert.equal(r.undeterminable, false, form);
+  }
+  // Other descriptors are bash "ambiguous redirect".
+  assert.equal(commandFileTargets("echo hi 2>&file.txt", "/tmp").undeterminable, true);
+  assert.equal(commandFileTargets("echo hi 3>&file.txt", "/tmp").undeterminable, true);
+  // fd duplications stay target-free for every descriptor.
+  assert.deepEqual(commandFileTargets("echo hi 1>&2", "/tmp").targets, []);
+  assert.deepEqual(commandFileTargets("echo hi 2>&1", "/tmp").targets, []);
+});

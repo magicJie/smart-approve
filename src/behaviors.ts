@@ -590,6 +590,7 @@ function redirectionTargets(
     // digits (`foo2>x` is NOT an fd prefix).
     let fdStart = index;
     while (fdStart > 0 && /\d/.test(segment[fdStart - 1])) fdStart--;
+    const leftFdDigits = segment.slice(fdStart, index);
     const leftFd = fdStart < index &&
       (fdStart === 0 || /[\s;|&(]/.test(segment[fdStart - 1]));
     const dupMarker = segment[cursor] === "&";
@@ -627,12 +628,19 @@ function redirectionTargets(
       //    an invalid form, undeterminable, NOT a fabricated file target.
       //  - `>&file` (no left fd, non-fd word): bash combined-stdout write.
       const isFdWord = wordValue === "-" || /^\d+$/.test(wordValue);
-      if (leftFd) {
-        if (!isFdWord) incomplete = true; // ambiguous redirect
-        index = cursor - 1;
+      if (isFdWord) {
+        index = cursor - 1; // fd duplication / close — no filesystem target
         continue;
       }
-      if (isFdWord) {
+      // Non-fd word: bash's combined `>&file` write is valid with NO fd
+      // prefix or an explicit stdout `1>&file`; any other descriptor
+      // (`2>&file`) is "ambiguous redirect" — undeterminable, not a
+      // fabricated file target (Z3).
+      const combinedOk = ch === ">"
+        ? !leftFd || leftFdDigits === "1"
+        : !leftFd;
+      if (!combinedOk) {
+        incomplete = true;
         index = cursor - 1;
         continue;
       }
@@ -745,7 +753,9 @@ function pathArg(rawToken: string | undefined): PathArg {
 function stripHeredocBodies(command: string): string {
   const lines = command.split("\n");
   const out: string[] = [];
-  const delimiters: { word: string; dash: boolean }[] = [];
+  const delimiters: { word: string; dash: boolean; quoted: boolean }[] = [];
+  let quote: string | undefined; // carried across lines (multi-line strings)
+
   for (const line of lines) {
     if (delimiters.length > 0) {
       const current = delimiters[0];
@@ -754,19 +764,44 @@ function stripHeredocBodies(command: string): string {
       continue; // body line (or the closing delimiter) — never a command
     }
     out.push(line);
-    // Parse this line's operators left to right (Y2):
-    //  - `<<<` is a here-string: NO closing word, NO body lines — the next
-    //    real command line is still a command, not heredoc text.
-    //  - `<<`/`<<-` is a heredoc: its delimiter (which may be quoted and may
-    //    follow whitespace) ends the body that starts on the NEXT line.
-    for (const match of line.matchAll(
-      /(<<<)|(<<)(-?)[ \t]*(?:"([^"]*)"|'([^']*)'|(\S+))/g,
-    )) {
-      if (match[1]) continue; // here-string — nothing to queue
-      delimiters.push({
-        word: match[4] ?? match[5] ?? match[6] ?? "",
-        dash: match[3] === "-",
-      });
+
+    // Recognize redirections only at real shell syntax positions — a `<<EOF`
+    // inside quotes or after a `#` comment is ordinary text, never a heredoc
+    // declaration that would swallow the following commands (Z1).
+    for (let i = 0; i < line.length; i++) {
+      const c = line[i];
+      if (quote === "'") {
+        if (c === "'") quote = undefined;
+        continue;
+      }
+      if (quote === "\"") {
+        if (c === "\\") { i++; continue; }
+        if (c === "\"") quote = undefined;
+        continue;
+      }
+      if (c === "\\") { i++; continue; }
+      if (c === "'" || c === "\"") { quote = c; continue; }
+      if (c === "#" && (i === 0 || /[\s;|&(]/.test(line[i - 1]))) break; // comment
+      if (c !== "<" || line[i + 1] !== "<") continue;
+      if (line[i + 2] === "<") { i += 2; continue; } // here-string — no body
+
+      let j = i + 2;
+      let dash = false;
+      if (line[j] === "-" || line[j] === "~") { dash = line[j] === "-"; j++; }
+      while (line[j] === " " || line[j] === "\t") j++;
+      let word = "";
+      let quoted = false;
+      if (line[j] === "'" || line[j] === "\"") {
+        quoted = true; // quoted delimiter → the body is NOT expanded
+        const q = line[j];
+        j++;
+        while (j < line.length && line[j] !== q) word += line[j++];
+        if (line[j] === q) j++;
+      } else {
+        while (j < line.length && !/[\s;&|()<>\n]/.test(line[j])) word += line[j++];
+      }
+      if (word) delimiters.push({ word, dash, quoted });
+      i = j - 1;
     }
   }
   return out.join("\n");
@@ -1893,7 +1928,7 @@ export function analyzeCommand(cmd: string): DangerAnalysis {
       }
 
       for (const { raw: rawTarget } of redirectionTargets(segment).targets.filter((t) => t.write)) {
-        const target = unquoteToken(rawTarget);
+        const target = evaluateShellWord(rawTarget); // same value as the domain check (Z2)
         const normalized = target.replace(/\\/g, "/");
         const sensitiveSystemWrite =
           /^(?:\/private)?\/etc\/(?:passwd|shadow|sudoers|hosts)(?:$|[./])/i.test(normalized) ||
