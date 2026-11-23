@@ -1538,16 +1538,19 @@ test("joined logical body lines are compared against the delimiter (M1)", () => 
 });
 
 test("a continuation-open body line at EOF still feeds substitution analysis (P1)", () => {
-  // The last body line ends in a continuation backslash at EOF — its
-  // substitution still executes in bash (with a missing-delimiter warning).
-  const targets = commandFileTargets("cat <<EOF\n$(cat note)\\", "/tmp");
+  // Parameterized: the continuation backslash at EOF, with and without a
+  // trailing real newline — bash executes the substitution either way
+  // (with a missing-delimiter warning).
+  for (const tail of ["\\", "\\\n"]) {
+  const targets = commandFileTargets(`cat <<EOF\n$(cat note)${tail}`, "/tmp");
   assert.ok(targets.targets.some((t) => t.value === "note"),
     `pending body line's substitution must be analyzed: ${JSON.stringify(targets)}`);
   assert.equal(targets.undeterminable, true, "still unterminated");
   // Behavior labels and confirmation propagate too.
-  const analysis = analyzeBashOperation("cat <<EOF\n$(rm -rf /tmp/x)\\", "/tmp", "/tmp");
+  const analysis = analyzeBashOperation(`cat <<EOF\n$(rm -rf /tmp/x)${tail}`, "/tmp", "/tmp");
   assert.ok(analysis.behaviors.includes("recursive-force-delete"));
   assert.equal(analysis.requiresConfirmation, true);
+  }
   // No continuation at EOF: existing behavior unchanged.
   const plain = commandFileTargets("cat <<EOF\n$(cat note)\nEOF\n", "/tmp");
   assert.ok(plain.targets.some((t) => t.value === "note"));
