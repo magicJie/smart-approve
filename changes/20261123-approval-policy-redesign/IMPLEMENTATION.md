@@ -274,3 +274,26 @@ $ bun run build       # dist/index.js 217.66 KB
 ```
 
 **偏差**：无。
+
+## 十四、复审修正 R8（对应 REVIEW.md「第八轮终审 · e86d354」Z1–Z3）
+
+复审对象：`e86d354`。Y3 已关闭；本轮 Z1/Z2/Z3 必修交付。
+
+| 项 | 修正 | 断言 |
+|----|------|------|
+| Z1（heredoc 须在 shell 语法位置识别） | `stripHeredocBodies` 改为逐字符扫描器：跟踪引号状态（跨行携带）、`#` 注释（行首或空白/分隔符后）直接停止该行识别；引号内或注释中的 `<<EOF` 不再入队吞掉后续真实命令；分隔词入队保留 `quoted` 属性（决定正文是否展开）；目标提取与行为分析继续共用同一份删减文本 | `heredoc markers only count at shell syntax positions (Z1)`：`echo "see <<EOF"` 后 `sort real.tsv` 照常计入、`# cat <<EOF` 注释后 `sort notes.tsv` 照常计入、真实 heredoc 正文仍剥离且 `sort after.tsv` 计入 |
+| Z2（写保护共用求值结果） | `write-sensitive-file`/块设备写保护循环的操作数由 `unquoteToken` 改为 `evaluateShellWord`——与域目标提取取同一份求值结果，裸写/完整引用/分片引用三种写法在两条路径一致 | `write protection shares the domain check's evaluated operand (Z2)`：`>/proc/sysrq-trigger`、`>"/proc/sysrq-trigger"`、`>"/proc"/sysrq-trigger` 三种写法的域目标值均为 `/proc/sysrq-trigger` 且均触发 write-sensitive-file；`cat <"/proc"/uptime` 不触发写保护 |
+| Z3（保留左侧描述符数值） | 记录 `leftFdDigits` 具体数值：`>&file`（隐式 stdout）与 `1>&file`（显式 stdout）均为合法合并写；`2>&file`/`3>&file` 等其他描述符按 bash `ambiguous redirect` 标 undeterminable；fd 复制仍无文件目标 | `left descriptor value decides combined-write validity (Z3)`：`>&file.txt`/`1>&file.txt` 计入目标且非 undeterminable、`2>&file.txt`/`3>&file.txt` undeterminable、`1>&2`/`2>&1` 无目标 |
+
+**复审修正 R8 后验证**：
+
+```
+$ bun run typecheck   # tsc --noEmit → clean
+$ bun test src
+ 263 pass
+ 0 fail
+Ran 263 tests across 14 files.
+$ bun run build       # dist/index.js 218.94 KB
+```
+
+**偏差**：无。
