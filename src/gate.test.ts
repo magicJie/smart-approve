@@ -236,7 +236,7 @@ test("bash: only the first leading cd target determines the effective cwd", asyn
   assert.equal(commented.calls.delegate, 0);
 });
 
-test("bash: literal cd segments entering sensitive directories are hard-blocked", async () => {
+test("bash: literal cd segments entering sensitive directories are reviewable", async () => {
   for (const command of [
     "cd /etc; touch marker",
     "cd /tmp && cd /etc && touch marker",
@@ -245,12 +245,19 @@ test("bash: literal cd segments entering sensitive directories are hard-blocked"
     "cd -- /etc && touch marker",
   ]) {
     const h = makeHarness();
+    h.selectResult = h.deps.t.sessionAllow;
     const r = await run(BashToolGate, h, { command });
-    assert.equal(r.isError, true, command);
-    assert.deepEqual(r.details, { blocked: true, reason: blockedLabel(r) }, command);
-    assert.equal(h.calls.analyze, 0, command);
-    assert.equal(h.calls.delegate, 0, command);
+    assert.equal(r.content[0].text, "native-run", command);
+    assert.equal(h.calls.delegate, 1, command);
   }
+
+  // Denied reviewable cd still blocks.
+  const denied = makeHarness();
+  const deniedResult = await run(BashToolGate, denied, {
+    command: "cd /etc; touch marker",
+  });
+  assert.equal(deniedResult.isError, true);
+  assert.equal(denied.calls.delegate, 0);
 
   // A literal, non-sensitive cd followed by `;` should not demand confirmation.
   const safe = makeHarness();
@@ -1017,15 +1024,24 @@ test("eval: relative writes after a dynamic directory change go through the mode
   assert.equal(noVerdict.calls.delegate, 0);
 });
 test("eval gates Python shell magics and writefile targets", async () => {
+  // ssh spawn is reviewable now: approved via the remember dialog.
   const shell = makeHarness();
-  const blockedShell = await run(EvalToolGate, shell, {
+  shell.selectResult = shell.deps.t.sessionAllow;
+  const allowedShell = await run(EvalToolGate, shell, {
     language: "py",
     code: "!ssh host",
   });
-  assert.equal(blockedShell.isError, true);
-  assert.match(blockedShell.content[0].text, /^Blocked:/);
-  assert.equal(shell.calls.analyze, 0);
-  assert.equal(shell.calls.delegate, 0);
+  assert.equal(allowedShell.content[0].text, "native-run");
+  assert.equal(shell.calls.delegate, 1);
+
+  // Denied reviewable spawn still blocks.
+  const deniedShell = makeHarness();
+  const deniedResult = await run(EvalToolGate, deniedShell, {
+    language: "py",
+    code: "!ssh host",
+  });
+  assert.equal(deniedResult.isError, true);
+  assert.equal(deniedShell.calls.delegate, 0);
 
   const protectedWrite = makeHarness({ mode: "auto", autoInHeadless: true }, { hasUI: false });
   const allowedWrite = await run(EvalToolGate, protectedWrite, {
@@ -1058,13 +1074,13 @@ test("eval gates Python shell magics and writefile targets", async () => {
   assert.match(blockedSystemWrite.content[0].text, /^Blocked:/);
   assert.equal(systemWrite.calls.delegate, 0);
 
+  // Sensitive cwd is reviewable: denied dialog → error.
   const sensitiveCwd = makeHarness();
   const blockedCwd = await run(EvalToolGate, sensitiveCwd, {
     language: "py",
     code: "%cd /etc",
   });
   assert.equal(blockedCwd.isError, true);
-  assert.match(blockedCwd.content[0].text, /^Blocked:/);
   assert.equal(sensitiveCwd.calls.delegate, 0);
 });
 

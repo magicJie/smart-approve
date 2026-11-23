@@ -144,7 +144,7 @@ export class EvalToolGate extends ToolGate {
       (writeTargets.cwdDynamic || unresolvedCwd) &&
       analysis.behaviors.includes("eval-process-spawn");
     const behaviors = new Set(analysis.behaviors);
-    let hardBlocked = analysis.hardBlocked || sensitiveCwd;
+    let hardBlocked = analysis.hardBlocked;
     let hardBlockedBySystemWrite = false;
     let requiresConfirmation = analysis.requiresConfirmation ?? false;
     let denyTier = analysis.denyTier;

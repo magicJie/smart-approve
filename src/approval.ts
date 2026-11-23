@@ -22,7 +22,7 @@ import { confirmWithRemember, formatAnalysis } from "./dialog";
 /** Narrow collaborator contracts (dependency inversion): concrete classes
  *  satisfy these structurally; tests can supply stubs. */
 export interface AllowListLike {
-  isAllowed(tool: string, content: string, cwd: string): boolean;
+  isAllowed(tool: string, content: string, cwd: string, analysisCwd?: string): boolean;
   rememberSession(tool: string, content: string, cwd: string): void;
   rememberPermanent(tool: string, content: string, cwd: string): void;
 }
@@ -75,6 +75,16 @@ export interface ApprovalRequest {
    *  so no memory option is offered. */
   memoryKey: string | null;
   cwd: string;
+  /** Cwd in effect before the subject's own `cd` segments; used for
+   *  domain-scoped allow-list matching (R3).  Defaults to `cwd`. */
+  analysisCwd?: string;
+  /** Local redesign: operation requires a human decision — remembered
+   *  decisions and auto verdicts never apply, and headless blocks.  Model
+   *  analysis still runs as dialog evidence when enabled. */
+  requiresConfirmation?: boolean;
+  /** Local redesign: regex-confident deny tier.  Auto mode with no usable
+   *  model verdict fails closed instead of asking or allowing. */
+  denyTier?: boolean;
   rememberScope: "session" | "both";
   /** Overrides the default "Dangerous command" dialog title. */
   title?: string;
@@ -89,6 +99,7 @@ export type ApprovalSource =
   | "user"
   | "no-ui"
   | "no-verdict"
+  | "deny-tier"
   | "aborted";
 
 export type ApprovalOutcome =
@@ -132,16 +143,32 @@ export class ApprovalFlow {
     if (signal?.aborted) return this.aborted();
 
     // Remembered decisions are human decisions; hard blocks are checked by
-    // the caller before this flow runs and therefore always win.
-    if (config.rememberDecisions && request.memoryKey !== null) {
-      if (allowList.isAllowed(request.toolName, request.memoryKey, request.cwd)) {
+    // the caller before this flow runs and therefore always win.  Operations
+    // that require confirmation never take the remembered-decision shortcut
+    // (local redesign: allow-list is gated on !requiresConfirmation).
+    if (!request.requiresConfirmation && config.rememberDecisions && request.memoryKey !== null) {
+      if (allowList.isAllowed(
+        request.toolName,
+        request.memoryKey,
+        request.cwd,
+        request.analysisCwd ?? request.cwd,
+      )) {
         logger.log(`${request.toolName}: remembered decision allows review`);
         return { allowed: true, source: "allowlist" };
       }
     }
 
     const hasUI = ctx.hasUI === true;
-    const autoMode = config.mode === "auto";
+    // B8: a headless session with autoInHeadless uses the auto path even
+    // when the global mode is interactive (DESIGN §7.1 worker goal).
+    const autoMode = config.mode === "auto" || (!hasUI && config.autoInHeadless);
+
+    // Protected/undeterminable operations always need a human; headless
+    // blocks regardless of mode or model verdict (local redesign).
+    if (request.requiresConfirmation && !hasUI) {
+      logger.log(`${request.toolName}: protected operation blocked (no UI) — ${request.label}`);
+      return this.block(request, "no-ui", t.blockedNoUI, t.decisionSourceNoUI);
+    }
 
     // No UI means no human can confirm.  Interactive always blocks; auto
     // blocks too unless autoInHeadless explicitly enables headless verdicts.
@@ -168,9 +195,23 @@ export class ApprovalFlow {
       );
     }
 
-    if (autoMode) {
+    if (autoMode && !request.requiresConfirmation) {
       if (decision) {
         return this.applyAutoDecision(request, decision, analysis, ctx);
+      }
+      if (request.denyTier) {
+        // Regex-confident deny tier with no usable model verdict: fail
+        // closed (local redesign deny-tier fallback, §八).
+        logger.log(`${request.toolName}: auto decision=block reason=deny-tier (${request.label})`);
+        ctx.ui.notify?.(t.autoBlockedDenyTier(request.label), "warning");
+        return {
+          allowed: false,
+          source: "deny-tier",
+          result: this.error(
+            `${t.autoBlockedDenyTier(request.label)}\n${request.subjectLabel}: ${request.displaySubject}`,
+            { blocked: true, reason: "deny-tier" },
+          ),
+        };
       }
       if (!hasUI) {
         logger.log(`${request.toolName}: blocked (no verdict, no UI) — ${request.label}`);
@@ -236,6 +277,9 @@ export class ApprovalFlow {
       `${request.toolName}: auto decision=${decision.verdict} reason=${decision.reason} (${request.label})`,
     );
     if (decision.verdict === "allow") {
+      logger.log(
+        `${request.toolName}: auto-allow-reviewable behaviors=[${request.behaviorLabels.join(",")}]`,
+      );
       ctx.ui.notify?.(t.autoAllowedByModel(request.label, detail), "info");
       return { allowed: true, source: "model" };
     }

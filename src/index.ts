@@ -479,6 +479,10 @@ class SmartApprove {
         // flow must review exactly `needsReview`, and remember each target.
         memoryKey: null,
         cwd,
+        // Local redesign: protected-path writes always need a human
+        // decision — no remembered shortcut, no auto verdict, headless
+        // blocks.  Model analysis still supplies dialog evidence.
+        requiresConfirmation: true,
         rememberScope: "both",
         title,
         remember: (choice) => {

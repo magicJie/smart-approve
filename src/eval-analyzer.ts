@@ -1375,8 +1375,6 @@ const BLOCK_DEVICE_WRITE =
 const SENSITIVE_OPEN_WRITE =
   /open\(\s*["']\/etc\/(?:passwd|shadow|sudoers|hosts)["']\s*,\s*["'][wa]/;
 
-/** Shutdown / reboot family. */
-const SHUTDOWN_CMD = /(?:^|[^\w$])(?:shutdown|reboot|halt|poweroff)\b/;
 
 function hasDangerousPayload(code: string): boolean {
   return (
@@ -1388,8 +1386,7 @@ function hasDangerousPayload(code: string): boolean {
     MKFS.test(code) ||
     SENSITIVE_FILE_WRITE.test(code) ||
     BLOCK_DEVICE_WRITE.test(code) ||
-    SENSITIVE_OPEN_WRITE.test(code) ||
-    SHUTDOWN_CMD.test(code)
+    SENSITIVE_OPEN_WRITE.test(code)
   );
 }
 
@@ -1398,8 +1395,7 @@ function hasDangerousPayload(code: string): boolean {
  * The payload may appear in any argument, not only in the command head.
  */
 const DANGEROUS_ARGUMENT_PATTERNS: RegExp[] = [
-  /\b(?:chmod|chown)\b/i,
-  /\bdd\b[^;\n]{0,100}?\bof=/i,
+  /\bdd\b[^;\n]{0,100}?\bof=\/dev\/(?:sd|nvme|disk|hd|vd|xvd|mmcblk|mapper|md\d|sg|st|nst)/i,
   /\brm\s+(?:-[a-z]*r[a-z]*f|-[a-z]*f[a-z]*r|-r\s+-f|-f\s+-r)\b/i,
   /\brm\s+--(?:recursive\s+--force|force\s+--recursive)\b/i,
   /\/etc\/(?:passwd|shadow|sudoers)\b/i,
@@ -1607,10 +1603,7 @@ export class EvalCodeBehaviorAnalyzer {
       !dangerousPayload &&
       launchCommands.some((command) => {
         const behaviors = analyzeCommand(command).behaviors;
-        return (
-          behaviors.includes("high-risk-executable") ||
-          behaviors.includes("interpreter-inline-execution")
-        );
+        return behaviors.includes("high-risk-shell-pivot");
       });
     const riskyArguments =
       hasProcessSpawn &&
@@ -1677,8 +1670,8 @@ export class EvalCodeBehaviorAnalyzer {
       found.has("eval-dynamic-host-tool-invocation");
     if (pythonScan?.externalSource) found.add("eval-external-source");
 
-    const hardBlocked =
-      dangerousPayload || riskyLaunch || riskyArguments || sensitiveCwd || shellSensitiveCwd;
+    // Sensitive cwd transitions are reviewable (DESIGN §3.1), not hard stops.
+    const hardBlocked = dangerousPayload || riskyLaunch || riskyArguments;
 
     const behaviors = [...found];
     const labels = behaviors.map((behavior) => BEHAVIORS[behavior] || makeLabel(behavior, behavior));

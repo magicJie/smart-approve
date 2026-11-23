@@ -9,35 +9,52 @@ import {
   isSensitiveWorkingDirectory,
 } from "./behaviors.ts";
 
-test("legacy high-risk executables remain hard-blocked", () => {
-  const commands = [
-    "osascript -e 'display dialog \\\"hi\\\"'",
-    "sudo id",
-    "ssh user@example.test",
-    "scp file user@example.test:/tmp/",
+test("high-risk executables split into three tiers", () => {
+  // Reviewable: network / crypto tools.
+  for (const command of [
+    "curl https://example.test/file",
+    "wget https://example.test/file",
+    "openssl s_client -connect example.test:443",
+    "nohup curl https://example.test/file",
+    "timeout 10s wget https://example.test/file",
+  ]) {
+    const result = analyzeCommand(command);
+    assert.ok(result.behaviors.includes("high-risk-net-tool"), command);
+    assert.equal(result.hardBlocked, false, `${command} is reviewable`);
+    assert.equal(result.denyTier, false, command);
+  }
+
+  // Hard block: raw network pivots.
+  for (const command of [
     "nc -l 1234",
     "netcat -l 1234",
     "ncat -e /bin/sh host 1234",
     "socat TCP-LISTEN:1234 EXEC:/bin/sh",
     "telnet example.test 23",
-    "openssl s_client -connect example.test:443",
-    "curl https://example.test/file",
-    "wget https://example.test/file",
-    "command -p ssh user@example.test",
-    "nohup curl https://example.test/file",
-    "timeout 10s wget https://example.test/file",
-    "time -p ssh user@example.test",
-  ];
-
-  for (const command of commands) {
+  ]) {
     const result = analyzeCommand(command);
-    assert.ok(result.behaviors.length > 0, `${command} must be reviewed`);
-    assert.equal(result.hardBlocked, true, `${command} remains prohibited`);
-    assert.equal(result.denyTier, false, `${command} is not an AI-review path`);
+    assert.ok(result.behaviors.includes("high-risk-shell-pivot"), command);
+    assert.equal(result.hardBlocked, true, `${command} stays hard-blocked`);
+    assert.equal(result.denyTier, false, command);
+  }
+
+  // Reviewable: privileged execution entry points.
+  for (const command of [
+    "osascript -e 'display dialog \\\"hi\\\"'",
+    "sudo id",
+    "ssh user@example.test",
+    "scp file user@example.test:/tmp/",
+    "command -p ssh user@example.test",
+    "time -p ssh user@example.test",
+  ]) {
+    const result = analyzeCommand(command);
+    assert.ok(result.behaviors.includes("privileged-exec"), command);
+    assert.equal(result.hardBlocked, false, `${command} is reviewable`);
+    assert.equal(result.denyTier, false, command);
   }
 });
 
-test("textual sudo in data stays safe while sudo launches remain hard-blocked", () => {
+test("textual sudo in data stays safe while sudo launches stay reviewable", () => {
   for (const command of ["echo 'sudo id'", "printf '%s\\n' 'sudo id'"]) {
     const result = analyzeCommand(command);
     assert.deepEqual(result.behaviors, [], command);
@@ -46,8 +63,8 @@ test("textual sudo in data stays safe while sudo launches remain hard-blocked", 
   }
 
   const launch = analyzeCommand("sudo id");
-  assert.ok(launch.behaviors.includes("high-risk-executable"));
-  assert.equal(launch.hardBlocked, true);
+  assert.ok(launch.behaviors.includes("privileged-exec"));
+  assert.equal(launch.hardBlocked, false);
   assert.equal(launch.denyTier, false);
 });
 
@@ -85,15 +102,16 @@ test("quoted commit messages and output data do not trigger command rules", () =
 });
 
 test("executable substitutions are inspected without treating quoted data as code", () => {
-  const executed: Array<[string, string]> = [
-    ['git commit -m "$(shutdown -h now)"', "shutdown-reboot"],
-    ['echo `sudo id`', "high-risk-executable"],
-    ["cat <(curl https://example.test/file)", "high-risk-executable"],
+  const executed: Array<[string, string, boolean]> = [
+    ['git commit -m "$(shutdown -h now)"', "shutdown-reboot", false],
+    ['echo `sudo id`', "privileged-exec", false],
+    ["cat <(curl https://example.test/file)", "high-risk-net-tool", false],
+    ['echo `nc -l 1234`', "high-risk-shell-pivot", true],
   ];
-  for (const [command, behavior] of executed) {
+  for (const [command, behavior, hard] of executed) {
     const result = analyzeCommand(command);
     assert.ok(result.behaviors.includes(behavior), command);
-    assert.equal(result.hardBlocked, true, command);
+    assert.equal(result.hardBlocked, hard, command);
   }
 
   for (const command of [
@@ -105,16 +123,31 @@ test("executable substitutions are inspected without treating quoted data as cod
   }
 });
 
-test("quoted actual shutdown, recursive-delete, and system-file operations stay blocked", () => {
+test("quoted actual recursive-delete and system-file operations stay blocked", () => {
   for (const command of [
-    "shutdown -h now",
-    "systemctl shutdown now",
     "rm -rf '/tmp/build'",
     "cat '/etc/passwd'",
     "echo secret > '/etc/passwd'",
   ]) {
     assert.equal(analyzeCommand(command).hardBlocked, true, command);
   }
+  // shutdown is reviewable now (§3.1), auto-rejected only when headless.
+  for (const command of ["shutdown -h now", "systemctl shutdown now"]) {
+    const result = analyzeCommand(command);
+    assert.ok(result.behaviors.includes("shutdown-reboot"), command);
+    assert.equal(result.hardBlocked, false, command);
+  }
+});
+
+test("shutdown-reboot auto-rejects when headless but stays reviewable with UI", () => {
+  const cwd = "/work/project";
+  const headless = analyzeBashOperation("shutdown -h now", cwd, cwd, false);
+  assert.equal(headless.hardBlocked, false);
+  assert.equal(headless.requiresConfirmation, true, "headless shutdown requires confirmation");
+
+  const interactive = analyzeBashOperation("shutdown -h now", cwd, cwd, true);
+  assert.equal(interactive.hardBlocked, false);
+  assert.equal(interactive.requiresConfirmation ?? false, false, "interactive shutdown goes to LLM/dialog");
 });
 
 test("sensitive account paths trigger only when used as file operands", () => {
@@ -140,7 +173,7 @@ test("sensitive files passed as search option files remain protected", () => {
   }
 });
 
-test("legacy interpreter execution flags remain hard-blocked without matching ordinary scripts", () => {
+test("interpreter execution flags stay reviewable without matching ordinary scripts", () => {
   for (const command of [
     "bash -c 'echo ok'",
     "bash -ic 'echo ok'",
@@ -150,7 +183,7 @@ test("legacy interpreter execution flags remain hard-blocked without matching or
   ]) {
     const result = analyzeCommand(command);
     assert.ok(result.behaviors.includes("interpreter-inline-execution"), command);
-    assert.equal(result.hardBlocked, true, command);
+    assert.equal(result.hardBlocked, false, command);
   }
 
   for (const command of ["bun run dev", "python3 manage.py runserver", "node server.js", "ls -la"]) {
@@ -160,23 +193,12 @@ test("legacy interpreter execution flags remain hard-blocked without matching or
   assert.deepEqual(analyzeCommand("echo 'ssh user@example.test'").behaviors, []);
 });
 
-test("migrated dangerous arguments are hard-blocked", () => {
+test("migrated dangerous arguments split between hard block and reviewable", () => {
+  // Still hard-blocked.
   for (const command of [
     "env rm -Rf /tmp/x",
     "env rm -r -f /tmp/x",
-    "chmod -R 777 /etc/foo",
-    "chown root:root /etc/passwd",
-    "dd if=/dev/zero of=disk.img",
-  ]) {
-    const result = analyzeCommand(command);
-    assert.ok(result.behaviors.length > 0, command);
-    assert.equal(result.hardBlocked, true, command);
-  }
-
-  for (const command of [
     "env mkfs.ext4 /dev/sdb1",
-    "systemctl shutdown now",
-    "reboot",
     ":(){ :|:& };:",
     "cat /etc/shadow",
     "echo x > /dev/sda",
@@ -186,15 +208,79 @@ test("migrated dangerous arguments are hard-blocked", () => {
     assert.equal(analyzeCommand(command).hardBlocked, true, command);
   }
 
+  // Reviewable now: shutdown family.
+  for (const command of ["systemctl shutdown now", "reboot"]) {
+    const result = analyzeCommand(command);
+    assert.ok(result.behaviors.includes("shutdown-reboot"), command);
+    assert.equal(result.hardBlocked, false, command);
+  }
+
   assert.equal(analyzeCommand("rm -rf /tmp/build").hardBlocked, true);
   assert.equal(analyzeCommand("rm -rf /").hardBlocked, true);
 });
 
-test("sensitive working directories hard-block only outside the session root", () => {
-  const outside = analyzeBashOperation("pwd", "/etc", "/work/project");
-  assert.equal(outside.hardBlocked, true);
-  assert.equal(outside.denyTier, false);
+test("dd splits by output target: block device hard-blocks, file stays reviewable", () => {
+  for (const command of [
+    "dd if=/dev/zero of=/dev/sda",
+    "dd if=img of=/dev/nvme0n1",
+    "dd if=img of=/dev/disk2",
+  ]) {
+    const result = analyzeCommand(command);
+    assert.ok(result.behaviors.includes("dd-block-device"), command);
+    assert.equal(result.hardBlocked, true, command);
+    assert.equal(result.denyTier, false, "hard block wins over deny tier");
+  }
 
+  const file = analyzeCommand("dd if=/dev/zero of=disk.img");
+  assert.ok(file.behaviors.includes("dd-write"));
+  assert.equal(file.hardBlocked, false);
+});
+
+test("permission-change splits into system (hard) vs user (reviewable)", () => {
+  const home = process.env.HOME || os.homedir();
+  const session = "/work/project";
+  const cwd = session;
+
+  // System targets, home root, and other-user chown → hard block.
+  const hard: string[] = [
+    "chmod -R 777 /etc/foo",
+    "chown root:root /etc/passwd",
+    "chmod 777 /usr/local/bin/tool",
+    `chmod 777 ${home}`,
+    "chmod 777 ~",
+    "chown nobody ./user-file",
+  ];
+  for (const command of hard) {
+    const result = analyzeBashOperation(command, cwd, session);
+    assert.ok(result.behaviors.includes("permission-change-system"), command);
+    assert.equal(result.hardBlocked, true, command);
+    assert.equal(result.denyTier, false, "hard block wins over deny tier");
+  }
+
+  // User-writable and out-of-domain targets → reviewable.
+  const reviewable: string[] = [
+    "chmod 600 ~/.draft",
+    `chmod 600 ${home}/file.txt`,
+    "chmod -R 777 ./dir",
+    "chmod 755 script.sh",
+    "chmod 777 /opt/thing",
+    "chmod 777 /tmp/scratch",
+  ];
+  for (const command of reviewable) {
+    const result = analyzeBashOperation(command, cwd, session);
+    assert.ok(result.behaviors.includes("permission-change-user"), command);
+    assert.equal(result.hardBlocked, false, command);
+  }
+});
+
+test("sensitive working directories are reviewable outside the session root", () => {
+  const outside = analyzeBashOperation("pwd", "/etc", "/work/project");
+  assert.ok(outside.behaviors.includes("sensitive-working-directory"));
+  assert.equal(outside.hardBlocked, false);
+  assert.equal(outside.denyTier, false);
+});
+
+test("cwd inside session root or temp dirs stays unflagged", () => {
   assert.deepEqual(
     analyzeBashOperation("pwd", "/work/project/subdir", "/work/project").behaviors,
     [],
@@ -217,7 +303,8 @@ test("home SSH and GnuPG directories are sensitive outside the session root", ()
   for (const directory of [".ssh", ".gnupg"]) {
     const cwd = path.join(process.env.HOME || os.homedir(), directory);
     const result = analyzeBashOperation("pwd", cwd, "/work/project");
-    assert.equal(result.hardBlocked, true, cwd);
+    assert.ok(result.behaviors.includes("sensitive-working-directory"), cwd);
+    assert.equal(result.hardBlocked, false, `${cwd} is reviewable, not hard-blocked`);
   }
 });
 
@@ -238,7 +325,7 @@ test("symlinked SSH directories stay sensitive after canonicalization", () => {
     process.env.HOME = home;
 
     assert.equal(isSensitiveWorkingDirectory(real, "/work/project"), true);
-    assert.equal(analyzeBashOperation("pwd", real, "/work/project").hardBlocked, true);
+    assert.equal(analyzeBashOperation("pwd", real, "/work/project").hardBlocked, false);
     assert.equal(isSensitiveWorkingDirectory(real, root), false);
   } finally {
     if (previousHome === undefined) delete process.env.HOME;
@@ -396,38 +483,39 @@ test("rmdir keeps the root hard block without flagging ordinary paths", () => {
   }
 });
 test("xargs and find execution clauses retain nested command checks", () => {
-  const blocked: Array<[string, string]> = [
-    ["echo now | xargs shutdown", "shutdown-reboot"],
-    ["echo x | xargs rm -rf /tmp/y", "recursive-force-delete"],
-    ["echo x | xargs -n 1 bash -c 'echo ok'", "interpreter-inline-execution"],
-    ["find . -name '*.log' -exec rm -rf {} +", "recursive-force-delete"],
+  const blocked: Array<[string, string, boolean]> = [
+    ["echo now | xargs shutdown", "shutdown-reboot", false],
+    ["echo x | xargs rm -rf /tmp/y", "recursive-force-delete", true],
+    ["echo x | xargs -n 1 bash -c 'echo ok'", "interpreter-inline-execution", false],
+    ["find . -name '*.log' -exec rm -rf {} +", "recursive-force-delete", true],
+    ["echo x | xargs nc -l 1234", "high-risk-shell-pivot", true],
   ];
-  for (const [command, behavior] of blocked) {
+  for (const [command, behavior, hard] of blocked) {
     const result = analyzeCommand(command);
     assert.ok(result.behaviors.includes(behavior), command);
-    assert.equal(result.hardBlocked, true, command);
+    assert.equal(result.hardBlocked, hard, command);
   }
 
   assert.deepEqual(analyzeCommand("find . -exec echo shutdown \\;").behaviors, []);
 });
 
-test("restored categories report their specific hard-block behavior", () => {
-  const cases: Array<[string, string]> = [
-    ["sudo id", "high-risk-executable"],
-    ["curl https://example.test/file", "high-risk-executable"],
-    ["bash -c 'echo ok'", "interpreter-inline-execution"],
-    ["rm -rf build", "recursive-force-delete"],
-    ["rm -r -f build", "recursive-force-delete"],
-    ["rm --recursive --force build", "recursive-force-delete"],
-    ["chmod -R 777 ./dir", "permission-change"],
-    ["dd if=/dev/zero of=disk.img", "dd-write"],
-    ["cat /etc/sudoers", "sensitive-file-reference"],
+test("restored categories report their specific behavior and tier", () => {
+  const cases: Array<[string, string, boolean]> = [
+    ["sudo id", "privileged-exec", false],
+    ["curl https://example.test/file", "high-risk-net-tool", false],
+    ["nc -l 1234", "high-risk-shell-pivot", true],
+    ["bash -c 'echo ok'", "interpreter-inline-execution", false],
+    ["rm -rf build", "recursive-force-delete", true],
+    ["rm -r -f build", "recursive-force-delete", true],
+    ["rm --recursive --force build", "recursive-force-delete", true],
+    ["dd if=/dev/zero of=disk.img", "dd-write", false],
+    ["dd if=/dev/zero of=/dev/sda", "dd-block-device", true],
+    ["cat /etc/sudoers", "sensitive-file-reference", true],
   ];
 
-  for (const [command, behavior] of cases) {
+  for (const [command, behavior, hard] of cases) {
     const result = analyzeCommand(command);
     assert.ok(result.behaviors.includes(behavior), command);
-    assert.equal(result.hardBlocked, true, command);
-    assert.equal(result.denyTier, false, command);
+    assert.equal(result.hardBlocked, hard, command);
   }
 });

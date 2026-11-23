@@ -9,7 +9,7 @@
 
 import type { DangerAnalysis } from "./types";
 import { makeLabel } from "./i18n";
-import { resolveFilesystemPathCandidates } from "./paths";
+import { isUserWritablePath, resolveFilesystemPathCandidates } from "./paths";
 import * as os from "node:os";
 import * as path from "node:path";
 
@@ -66,8 +66,14 @@ const BEHAVIORS: Record<string, { en: string; zh: string }> = {
   "git-force-push-protected": makeLabel("git force push to protected branch", "git 强制推送到保护分支"),
   "delete-home": makeLabel("Delete home directory (~)", "删除家目录 ~"),
   "high-risk-executable": makeLabel("High-risk process launch", "启动高风险程序"),
+  "high-risk-net-tool": makeLabel("Network / crypto utility launch", "启动网络/加密工具"),
+  "high-risk-shell-pivot": makeLabel("Raw network pivot tool (reverse-shell class)", "启动裸网络枢轴工具（反弹 Shell 类）"),
+  "privileged-exec": makeLabel("Privileged execution (sudo/ssh/scp/osascript)", "提权执行 sudo/ssh/scp/osascript"),
   "interpreter-inline-execution": makeLabel("Interpreter executes inline code", "解释器执行内联代码"),
   "permission-change": makeLabel("Changes file permissions or ownership", "修改文件权限或所有者"),
+  "permission-change-system": makeLabel("Changes system path permissions or other-user ownership", "修改系统路径权限或改其他用户属主"),
+  "permission-change-user": makeLabel("Changes permissions on user-writable paths", "修改用户可写路径的权限"),
+  "dd-block-device": makeLabel("dd writes directly to a block device", "dd 直接写入块设备"),
   "dd-write": makeLabel("Writes data to a file with dd", "使用 dd 写入文件"),
   "sensitive-file-reference": makeLabel("Access to protected system account files", "访问受保护的系统账号文件"),
   "sensitive-working-directory": makeLabel("Runs outside the session in a sensitive directory", "在会话目录外的敏感目录运行"),
@@ -77,19 +83,29 @@ const BEHAVIORS: Record<string, { en: string; zh: string }> = {
 // and other data. Retain only this shell-grammar signature; command families
 // are matched from parsed executable names and arguments below.
 const FORK_BOMB_PATTERN = /(?:^|[;&|])\s*:\s*\(\s*\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/;
-const HIGH_RISK_EXECUTABLES: Record<string, true> = {
-  osascript: true,
-  sudo: true,
-  ssh: true,
-  scp: true,
+/** Reviewable: common AI-task network and crypto tools. */
+const HIGH_RISK_NET_TOOLS: Record<string, true> = {
+  openssl: true,
+  curl: true,
+  wget: true,
+};
+
+/** Hard block: raw network primitives; reverse-shell toolkit with almost no
+ *  legitimate use in AI tasks. */
+const HIGH_RISK_SHELL_PIVOTS: Record<string, true> = {
   nc: true,
   netcat: true,
   ncat: true,
   socat: true,
   telnet: true,
-  openssl: true,
-  curl: true,
-  wget: true,
+};
+
+/** Reviewable: privilege-escalation / remote-execution entry points. */
+const PRIVILEGED_EXECS: Record<string, true> = {
+  osascript: true,
+  sudo: true,
+  ssh: true,
+  scp: true,
 };
 
 const INTERPRETERS: Record<string, true> = {
@@ -708,6 +724,104 @@ function isWithinDirectory(candidate: string, directory: string): boolean {
     candidate.startsWith(directory === path.sep ? path.sep : `${directory}${path.sep}`);
 }
 
+/**
+ * Permission-change hard-block scope (DESIGN §3.3/§4.2):
+ *  - resolved targets under system directories are `permission-change-system`;
+ *  - chmod/chown of the home root itself is `permission-change-system`;
+ *  - chown whose OWNER differs from the current user is `permission-change-system`;
+ *  - targets inside home or the session cwd are `permission-change-user`.
+ * Out-of-domain paths stay reviewable (`permission-change-user` tier) — the
+ * LLM decides with task context rather than a hard stop.
+ */
+const PERMISSION_SYSTEM_PATH_RE =
+  /^\/(?:etc|usr|bin|sbin|var|boot|sys|proc|root|Library|System)(?:\/|$)/i;
+
+/** Block devices as operand values (shared with redirection checks). */
+const BLOCK_DEVICE_PATH_RE =
+  /^\/dev\/(?:sd[a-z]\d*|nvme\d+(?:n\d+)?(?:p\d+)?|disk\d+(?:s\d+)?|hd[a-z]\d*|vd[a-z]\d*|xvd[a-z]\d*|mmcblk\d+(?:p\d+)?|mapper\/[^/]+|md\d+|sg\d+|st\d+|nst\d+)$/i;
+
+interface PermissionInvocation {
+  name: string;
+  args: string[];
+}
+
+/** Parse the OWNER[:GROUP] spec of a chown invocation (chgrp has none). */
+function chownOwner(args: string[]): string | undefined {
+  const operands = args.filter((arg) => arg !== "--" && !arg.startsWith("-"));
+  const spec = operands[0];
+  if (spec === undefined) return undefined;
+  const owner = spec.split(":")[0];
+  return owner === "" ? undefined : owner;
+}
+
+/**
+ * Classify one chmod/chown invocation by target domain.  `cwd` is the
+ * effective command cwd used to resolve relative targets; `sessionCwd`
+ * bounds the task domain.  Returns the behavior id to emit.
+ */
+function permissionChangeTier(
+  invocation: PermissionInvocation,
+  cwd: string,
+  sessionCwd: string,
+  home = process.env.HOME || os.homedir(),
+  user = process.env.USER || os.userInfo().username,
+): "permission-change-system" | "permission-change-user" {
+  const { name, args } = invocation;
+  const operands = args.filter((arg) => arg !== "--" && !arg.startsWith("-"));
+  const targets = name === "chmod"
+    ? operands.slice(1)
+    : name === "chgrp"
+      ? operands.slice(1)
+      : operands.slice(1); // chown: OWNER[:GROUP] first
+
+  if (name === "chown") {
+    const owner = chownOwner(args);
+    if (owner !== undefined && owner !== user) return "permission-change-system";
+  }
+
+  const homeCandidates = resolveFilesystemPathCandidates(home, home);
+  for (const target of targets) {
+    if (PERMISSION_SYSTEM_PATH_RE.test(target)) return "permission-change-system";
+    const candidates = resolveFilesystemPathCandidates(target, cwd);
+    for (const candidate of candidates) {
+      if (PERMISSION_SYSTEM_PATH_RE.test(candidate)) return "permission-change-system";
+      // chmod/chown of the home root itself stays a hard stop.
+      if (homeCandidates.some((root) => candidate === root)) {
+        return "permission-change-system";
+      }
+    }
+  }
+  // Out-of-domain paths stay reviewable (§4.2): the LLM judges whether the
+  // task authorizes the target; the hard stops above already fired.
+  return "permission-change-user";
+}
+
+/** Collect chmod/chown/chgrp invocations from a raw command's segments. */
+export function permissionChangeInvocations(command: string): PermissionInvocation[] {
+  const invocations: PermissionInvocation[] = [];
+  const pending = [normalize(command)];
+  while (pending.length > 0) {
+    const text = pending.pop() ?? "";
+    const substitutions = findShellSubstitutions(text);
+    for (const substitution of substitutions) pending.push(substitution.body);
+    const executableCommand = stripShellSubstitutions(text, substitutions);
+    for (const segment of splitShellCommands(executableCommand)) {
+      const invocation = commandAndArgs(segment);
+      if (!invocation) continue;
+      if (invocation.name === "find") {
+        for (const commandArgs of findExecCommands(invocation.args)) {
+          pending.push(commandArgs.map(quoteShellArgument).join(" "));
+        }
+        continue;
+      }
+      if (["chmod", "chown", "chgrp"].includes(invocation.name)) {
+        invocations.push(invocation);
+      }
+    }
+  }
+  return invocations;
+}
+
 
 /**
  * True when `cwd` is inside a sensitive system location and outside the
@@ -1006,12 +1120,10 @@ const HARD_BLOCK_BEHAVIORS: Record<string, true> = {
   "sensitive-file-reference": true,
   "write-block-device": true,
   "disk-format": true,
-  "shutdown-reboot": true,
-  "high-risk-executable": true,
-  "interpreter-inline-execution": true,
-  "permission-change": true,
-  "dd-write": true,
-  "sensitive-working-directory": true,
+  "high-risk-shell-pivot": true,
+  "chmod-sys-dir": true,
+  "permission-change-system": true,
+  "dd-block-device": true,
 };
 
 /** Deny-tier behaviors: regex-confident enough to block without an LLM
@@ -1019,6 +1131,8 @@ const HARD_BLOCK_BEHAVIORS: Record<string, true> = {
  *  commands never report deny tier — the harder tier wins. */
 const DENY_TIER_BEHAVIORS: Record<string, true> = {
   "git-force-push-protected": true,
+  "permission-change-system": true,
+  "dd-block-device": true,
 };
 
 /** Normalize shell input without treating `#` inside quotes as a comment. */
@@ -1061,7 +1175,9 @@ export function analyzeCommand(cmd: string): DangerAnalysis {
         }
       }
       if (isGlobalPackageUninstall(name, args)) behaviorSet.add("pkg-global-uninstall");
-      if (HIGH_RISK_EXECUTABLES[name] === true) behaviorSet.add("high-risk-executable");
+      if (HIGH_RISK_NET_TOOLS[name] === true) behaviorSet.add("high-risk-net-tool");
+      if (HIGH_RISK_SHELL_PIVOTS[name] === true) behaviorSet.add("high-risk-shell-pivot");
+      if (PRIVILEGED_EXECS[name] === true) behaviorSet.add("privileged-exec");
       if (
         INTERPRETERS[name] === true ||
         /^(?:python(?:\d+(?:\.\d+)*)?|pypy\d*)$/.test(name) ||
@@ -1069,7 +1185,8 @@ export function analyzeCommand(cmd: string): DangerAnalysis {
       ) {
         if (hasInterpreterExecutionFlag(args)) behaviorSet.add("interpreter-inline-execution");
       }
-      if (name === "chmod" || name === "chown") behaviorSet.add("permission-change");
+      // chmod/chown/chgrp are classified by target domain in
+      // analyzeBashOperation (permission-change-system vs -user).
 
       const positional = args.filter((arg) => arg !== "--" && !arg.startsWith("-"));
       const destination = positional[positional.length - 1];
@@ -1124,7 +1241,14 @@ export function analyzeCommand(cmd: string): DangerAnalysis {
           destination !== undefined &&
           /^\/etc\/(?:passwd|shadow|sudoers|hosts)$/i.test(destination));
       if (writesSensitiveFile) behaviorSet.add("write-sensitive-file");
-      if (name === "dd" && args.some((arg) => /^of=/.test(arg))) behaviorSet.add("dd-write");
+      if (name === "dd" && args.some((arg) => /^of=/.test(arg))) {
+        const ofTarget = args.find((arg) => /^of=/.test(arg))?.slice(3) ?? "";
+        behaviorSet.add(
+          BLOCK_DEVICE_PATH_RE.test(ofTarget.replace(/\\/g, "/"))
+            ? "dd-block-device"
+            : "dd-write",
+        );
+      }
       if (name === "mkfs" || name.startsWith("mkfs.")) behaviorSet.add("disk-format");
       if (
         (name === "mount" || name === "umount") &&
@@ -1162,8 +1286,7 @@ export function analyzeCommand(cmd: string): DangerAnalysis {
         const sensitiveSystemWrite =
           /^(?:\/private)?\/etc\/(?:passwd|shadow|sudoers|hosts)(?:$|[./])/i.test(normalized) ||
           /^\/(?:proc|sys)(?:\/|$)/i.test(normalized);
-        const blockDeviceWrite =
-          /^\/dev\/(?:sd[a-z]\d*|nvme\d+(?:n\d+)?(?:p\d+)?|disk\d+(?:s\d+)?|hd[a-z]\d*|vd[a-z]\d*|xvd[a-z]\d*|mmcblk\d+(?:p\d+)?|mapper\/[^/]+|md\d+|sg\d+|st\d+|nst\d+)$/i.test(normalized);
+        const blockDeviceWrite = BLOCK_DEVICE_PATH_RE.test(normalized);
         if (sensitiveSystemWrite || blockDeviceWrite) behaviorSet.add("write-sensitive-file");
         if (blockDeviceWrite) behaviorSet.add("write-block-device");
       }
@@ -1172,7 +1295,10 @@ export function analyzeCommand(cmd: string): DangerAnalysis {
     if (FORK_BOMB_PATTERN.test(syntax)) behaviorSet.add("fork-bomb");
     if (
       /(?:^|[;&|])\s*(?:echo|printf)\b[^|\n]*\|\s*(?:sudo\s+)?(?:sh|bash|zsh|fish|python3?|perl|ruby|node)\b/i.test(syntax) ||
-      /(?:^|[;&|])\s*(?:(?:env|command|nohup)\s+)*fetch\b[^|\n]*\|\s*(?:sudo\s+)?(?:sh|bash|zsh|fish|python3?|perl|ruby|node)\b/i.test(syntax)
+      /(?:^|[;&|])\s*(?:(?:env|command|nohup)\s+)*fetch\b[^|\n]*\|\s*(?:sudo\s+)?(?:sh|bash|zsh|fish|python3?|perl|ruby|node)\b/i.test(syntax) ||
+      // curl/wget piped straight into an interpreter is the classic supply-chain
+      // pattern; it must stay hard-blocked now that curl/wget are reviewable.
+      /(?:^|[;&|])\s*(?:(?:env|command|nohup|timeout\s+\S+|nice|sudo)\s+)*(?:curl|wget)\b[^|\n]*\|\s*(?:sudo\s+)?(?:sh|bash|zsh|fish|python3?|perl|ruby|node)\b/i.test(syntax)
     ) {
       behaviorSet.add("remote-fetch-exec");
     }
@@ -1187,16 +1313,39 @@ export function analyzeCommand(cmd: string): DangerAnalysis {
   return { behaviors, labels, hardBlocked, denyTier };
 }
 
-/** Analyze a command plus its explicit execution cwd. */
-export function analyzeBashOperation(command: string, cwd: string, sessionCwd: string): DangerAnalysis {
+/**
+ * Analyze a command plus its explicit execution cwd.
+ * Adds cwd/session-scoped behaviors on top of analyzeCommand:
+ *  - permission-change → permission-change-system (hard) or -user (reviewable)
+ *  - sensitive-working-directory → reviewable (was hard block; DESIGN §3.1)
+ *  - hasUI=false → shutdown-reboot requires confirmation (headless auto-reject, §九-1b)
+ */
+export function analyzeBashOperation(
+  command: string,
+  cwd: string,
+  sessionCwd: string,
+  hasUI = true,
+): DangerAnalysis {
   const analysis = analyzeCommand(command);
-  if (!isSensitiveWorkingDirectory(cwd, sessionCwd)) return analysis;
 
-  const behaviors = analysis.behaviors.includes("sensitive-working-directory")
-    ? analysis.behaviors
-    : [...analysis.behaviors, "sensitive-working-directory"];
-  const labels = behaviors === analysis.behaviors
-    ? analysis.labels
-    : [...analysis.labels, BEHAVIORS["sensitive-working-directory"]];
-  return { ...analysis, behaviors, labels, hardBlocked: true, denyTier: false };
+  const behaviorSet = new Set(analysis.behaviors);
+  for (const invocation of permissionChangeInvocations(command)) {
+    behaviorSet.add(permissionChangeTier(invocation, cwd, sessionCwd));
+  }
+  if (isSensitiveWorkingDirectory(cwd, sessionCwd)) {
+    behaviorSet.add("sensitive-working-directory");
+  }
+
+  const behaviors = [...behaviorSet];
+  const labels = behaviors.map((behavior) =>
+    BEHAVIORS[behavior] || makeLabel(behavior, behavior),
+  );
+  const hardBlocked = behaviors.some((behavior) => behavior in HARD_BLOCK_BEHAVIORS);
+  const denyTier =
+    !hardBlocked && behaviors.some((behavior) => behavior in DENY_TIER_BEHAVIORS);
+  const requiresConfirmation =
+    (analysis.requiresConfirmation ?? false) ||
+    (!hasUI && behaviorSet.has("shutdown-reboot"));
+
+  return { behaviors, labels, hardBlocked, denyTier, requiresConfirmation };
 }

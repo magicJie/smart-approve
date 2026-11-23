@@ -11,6 +11,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AllowEntry } from "./types";
 import { normalize } from "./behaviors";
+import { matchGlob, resolveFilesystemPathCandidates } from "./paths";
 import type { Logger } from "./logger";
 
 /** Normalize a key for dedup: tool + normalized-content + cwd. */
@@ -61,14 +62,57 @@ export class AllowList {
     }
   }
 
-  /** Check if a decision is remembered (session or permanent). */
+  /**
+   * Check if a decision is remembered (session or permanent).
+   * Matching order (§6.2): exact key first, then the entry's optional
+   * `pattern` glob over the normalized command, then the optional `domain`
+   * scope over the command's path-like arguments.
+   */
   isAllowed(tool: string, content: string, cwd: string): boolean {
     const key = makeAllowKey(tool, content, cwd);
     if (this.sessionAllows.has(key)) return true;
     const normalized = tool === "bash" ? normalize(content) : path.resolve(content);
-    return this.permanent.some(
-      (e) => e.tool === tool && e.key === normalized && e.cwd === cwd,
+    return this.permanent.some((e) => {
+      if (e.tool !== tool) return false;
+      // Exact entries stay cwd-scoped; pattern/domain entries carry their
+      // own scope and apply from any cwd.
+      if (e.key === normalized && e.cwd === cwd) return true;
+      if (typeof e.pattern === "string" && matchGlob(e.pattern, normalized)) return true;
+      if (typeof e.domain === "string" && this.allTargetsWithinDomain(normalized, e, cwd)) return true;
+      return false;
+    });
+  }
+
+  /**
+   * `domain` entries allow a command only when every path-like argument
+   * resolves inside the recorded domain.  Commands with no path arguments
+   * match when the current cwd itself is inside the domain.
+   */
+  private allTargetsWithinDomain(normalized: string, entry: AllowEntry, cwd: string): boolean {
+    const domain = resolveFilesystemPathCandidates(entry.domain ?? "", entry.cwd);
+    const within = (target: string, base: string): boolean =>
+      resolveFilesystemPathCandidates(target, base).some((candidate) =>
+        domain.some((directory) =>
+          candidate === directory ||
+          candidate.startsWith(directory.endsWith("/") ? directory : `${directory}/`),
+        ),
+      );
+
+    const pathTokens = normalized.split(/\s+/).map((token) => {
+      const value = token.includes("=") ? token.split("=").pop() ?? "" : token;
+      return value.replace(/^["']|["']$/g, "");
+    }).filter((cleaned) =>
+      cleaned.startsWith("/") || cleaned.startsWith("~") || cleaned.startsWith(".") ||
+      cleaned.startsWith("$HOME"),
     );
+    if (pathTokens.length === 0) {
+      return domain.some((root) =>
+        resolveFilesystemPathCandidates(cwd, cwd).some((candidate) =>
+          candidate === root || candidate.startsWith(`${root}/`),
+        ),
+      );
+    }
+    return pathTokens.every((token) => within(token, cwd));
   }
 
   /** Record a session allow. */

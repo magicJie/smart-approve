@@ -427,6 +427,18 @@ export class BashToolGate extends ToolGate {
     });
   }
 
+  /** Pre-`cd` analysis cwd — the command's own cd is applied by the
+   *  analyzer/domain extraction, not double-applied (R3). */
+  protected analysisCwd(params: unknown, ctx: ExtensionCtx): string {
+    const raw = typeof params === "object" && params !== null
+      ? params as Record<string, unknown>
+      : {};
+    return resolveRequestedCwd(
+      typeof raw.cwd === "string" ? raw.cwd : undefined,
+      ctx.cwd || process.cwd(),
+    );
+  }
+
   protected extractSubject(params: unknown): string {
     if (typeof params !== "object" || params === null || !("command" in params)) return "";
     return typeof params.command === "string" ? params.command : "";
@@ -454,9 +466,13 @@ export class BashToolGate extends ToolGate {
     const sessionCandidates = resolveFilesystemPathCandidates(sessionBase, sessionBase);
     const sessionCwd = sessionCandidates[sessionCandidates.length - 1] ?? sessionBase;
 
-    const analysis = leadingUnresolved
+    // R3: the analyzer receives the cwd in effect BEFORE the command's own
+    // leading `cd` — it re-applies that transition itself per segment, so
+    // feeding it the already-switched cwd would apply `cd` twice.
+    const analysisCwd = resolveRequestedCwd(requestedCwd, sessionBase);
+    const analysis = leadingUnresolved || isUnresolvedCwd(analysisCwd)
       ? analyzeCommand(subject)
-      : analyzeBashOperation(subject, cwd, sessionCwd);
+      : analyzeBashOperation(subject, analysisCwd, sessionCwd, ctx.hasUI);
 
     let hardBlocked = analysis.hardBlocked;
     let denyTier = analysis.denyTier;
@@ -480,7 +496,7 @@ export class BashToolGate extends ToolGate {
     };
 
     const scanned = collectCdTargets(subject);
-    const initialCwd = resolveRequestedCwd(requestedCwd, sessionBase);
+    const initialCwd = analysisCwd;
     const initialSentinel = isUnresolvedCwd(initialCwd);
     const initialVirtual = /^[A-Za-z][A-Za-z0-9+.-]*:\/\//.test(initialCwd);
     let chainUnknown =
@@ -497,13 +513,12 @@ export class BashToolGate extends ToolGate {
         if (!absoluteTarget) continue;
         // Once the relative chain is unknown, an absolute cd can still enter
         // a sensitive directory and must be checked independently.
-        merge(analyzeBashOperation("", resolveCwdCandidate(target, sessionCwd), sessionCwd));
+        merge(analyzeBashOperation("", resolveCwdCandidate(target, sessionCwd), sessionCwd, ctx.hasUI));
         continue;
       }
       const resolved = resolveCwdCandidate(path.resolve(currentCwd, target), currentCwd);
-      // Check sensitivity before existence so a missing sensitive target still
-      // hard-blocks instead of downgrading to a generic confirmation.
-      merge(analyzeBashOperation("", resolved, sessionCwd));
+      // Missing sensitive targets must not downgrade to a generic confirmation.
+      merge(analyzeBashOperation("", resolved, sessionCwd, ctx.hasUI));
       if (isUnresolvedCwd(resolved) || !isExistingDirectory(resolved)) {
         chainTrusted = false;
         continue;

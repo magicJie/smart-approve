@@ -210,13 +210,14 @@ export interface DangerAnalysis {
   behaviors: string[];
   /** Localized labels for display. */
   labels: { en: string; zh: string }[];
-  /** True if any matched behavior is in the regex-confident deny tier.  This
-   *  is evidence for review, not an automatic verdict by itself. */
+  /** True if any matched behavior is in the regex-confident deny tier.  In
+   *  auto mode with no usable model verdict this fails closed. */
   denyTier: boolean;
   /** True if any matched behavior is in the hard-block set. */
   hardBlocked: boolean;
-  /** Statically identified as needing review even when no behavior label was
-   *  matched.  It no longer bypasses the model or the allow-list. */
+  /** Requires a human decision: remembered decisions and auto verdicts do
+   *  not apply, and headless sessions block.  Model analysis still runs as
+   *  dialog evidence when enabled. */
   requiresConfirmation?: boolean;
   /** False when this operation cannot be safely keyed for memorized
    *  decisions because its target depends on runtime state (for example an
@@ -235,6 +236,12 @@ export interface AllowEntry {
   cwd: string;
   /** ISO timestamp of the decision. */
   timestamp: string;
+  /** Optional glob over the normalized command, e.g. "chmod * ~~/projects/**".
+   *  Matched after the exact key check. */
+  pattern?: string;
+  /** Optional allowed target-path domain; the allow applies only when every
+   *  path-like argument resolves inside this directory. */
+  domain?: string;
 }
 
 /** Compact excerpts of the agent's conversation history fed to the LLM. */

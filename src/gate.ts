@@ -74,6 +74,12 @@ export abstract class ToolGate {
   protected abstract extractSubject(params: unknown): string;
   /** Working directory used for allowlist scoping. */
   protected abstract resolveCwd(params: unknown, ctx: ExtensionCtx): string;
+  /** Working directory used by the analyzer/domain extraction — the cwd in
+   *  effect before the subject's own `cd` segments.  Defaults to the
+   *  allowlist cwd; bash overrides it (R3 double-cd). */
+  protected analysisCwd(params: unknown, ctx: ExtensionCtx): string {
+    return this.resolveCwd(params, ctx);
+  }
   /** Per-tool behavior analysis. */
   protected abstract analyze(subject: string, params: unknown, ctx: ExtensionCtx): DangerAnalysis;
   /** Allowlist key derived from the subject. */
@@ -158,6 +164,10 @@ export abstract class ToolGate {
     }
 
     const memoryEligible = analysis.memoryEligible !== false;
+    const behaviorLabels = analysis.labels.map((item) => item[lang] || item.en);
+    if (analysis.behaviors.includes("privileged-exec")) {
+      behaviorLabels.push(t.promptPrivilegedNote);
+    }
     const outcome = await this.approval.decide(
       {
         toolName: this.toolName,
@@ -166,10 +176,13 @@ export abstract class ToolGate {
         promptSubject: subject,
         promptSubjectLabel: this.promptSubjectLabel(),
         displaySubject: subject,
-        behaviorLabels: analysis.labels.map((item) => item[lang] || item.en),
+        behaviorLabels,
         memoryKey: memoryEligible ? this.buildKey(subject) : null,
         cwd: effectiveCwd,
+        analysisCwd: this.analysisCwd(params, ctx),
         rememberScope: this.rememberScope,
+        requiresConfirmation: analysis.requiresConfirmation === true,
+        denyTier: analysis.denyTier,
       },
       ctx,
       signal,
