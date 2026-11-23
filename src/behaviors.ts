@@ -776,50 +776,53 @@ function findHeredocSubstitutions(body: string): string[] {
   return result;
 }
 
+/** Marker line emitted before a heredoc declaration line; the walkers turn
+ *  it into an INDEPENDENT analysis unit carrying the cwd in effect at the
+ *  declaration point (Q1). */
+const HEREDOC_SUB_MARK = "__SA_HEREDOC_SUB__";
+
 /** Remove heredoc bodies so their literal text never becomes commands or
- *  file targets (X4/Z1).  For UNQUOTED delimiters the body's command
- *  substitutions execute for real, so they are inlined at the body's stream
- *  position — subsequent analysis sees them with the cwd in effect there
- *  (Q1).  Quoted-delimiter bodies are pure data and vanish.  `unterminated`
- *  marks a heredoc whose closing delimiter never appeared: the body
- *  boundary can't be proven and the caller must propagate undeterminable. */
+ *  file targets (X4/Z1).  Unquoted bodies execute their command
+ *  substitutions; those are returned as `substitutionBodies[id]` with a
+ *  `__SA_HEREDOC_SUB__<id>` marker line placed BEFORE the declaration line,
+ *  so each substitution is analyzed as its own unit with the cwd at the
+ *  declaration point — its internal `cd` can't leak into the parent, and a
+ *  `cd` later on the declaration line can't reach backwards into it (Q1).
+ *  Quoted-delimiter bodies are pure data and vanish.  `unterminated` marks
+ *  a heredoc whose closing delimiter never appeared. */
 function stripHeredocBodies(command: string): {
   text: string;
+  substitutionBodies: string[];
   unterminated: boolean;
 } {
   const lines = command.split("\n");
   const out: string[] = [];
-  const delimiters: { word: string; dash: boolean; quoted: boolean }[] = [];
+  const delimiters: { id: number; word: string; dash: boolean; quoted: boolean }[] = [];
+  const bodies: string[] = [];
+  const substitutionBodies: string[] = [];
   let quote: string | undefined; // carried across lines (multi-line strings)
-  let bodyLines: string[] = [];
-
-  const closeBody = (quoted: boolean): void => {
-    if (!quoted) {
-      for (const sub of findHeredocSubstitutions(bodyLines.join("\n"))) {
-        out.push(sub);
-      }
-    }
-    bodyLines = [];
-  };
+  let nextId = 0;
 
   for (const line of lines) {
     if (delimiters.length > 0) {
-      // Each queued delimiter carries its OWN dash/quoted attributes (Q3).
+      // Each queued delimiter carries its OWN id/dash/quoted attributes (Q3).
       const current = delimiters[0];
       const candidate = current.dash ? line.replace(/^\t+/, "") : line;
       if (candidate === current.word) {
-        closeBody(current.quoted);
+        if (!current.quoted) {
+          substitutionBodies[current.id] =
+            findHeredocSubstitutions(bodies[current.id] ?? "").join("\n");
+        }
         delimiters.shift();
       } else {
-        bodyLines.push(line);
+        bodies[current.id] = (bodies[current.id] ? `${bodies[current.id]}\n` : "") + line;
       }
       continue; // body line (or the closing delimiter) — never a command
     }
-    out.push(line);
 
-    // Recognize redirections only at real shell syntax positions — a `<<EOF`
-    // inside quotes or after a `#` comment is ordinary text, never a heredoc
-    // declaration that would swallow the following commands (Z1).
+    // Recognize redirections only at real shell syntax positions (Z1) —
+    // markers are collected first and emitted BEFORE the declaration line.
+    const markers: string[] = [];
     for (let i = 0; i < line.length; i++) {
       const c = line[i];
       if (quote === "'") {
@@ -841,9 +844,7 @@ function stripHeredocBodies(command: string): {
       let dash = false;
       if (line[j] === "-" || line[j] === "~") { dash = line[j] === "-"; j++; }
       while (line[j] === " " || line[j] === "\t") j++;
-      // Read the COMPLETE delimiter word — quoted and unquoted fragments
-      // concatenate (`<<'E'OF` ≡ `<<EOF`), and ANY quoting (single, double,
-      // or a backslash like `<<\EOF`) makes the body literal (Q3).
+      // Read the COMPLETE delimiter word (Q3); ANY quoting makes it literal.
       const wordStart = j;
       let quoted = false;
       while (j < line.length) {
@@ -863,16 +864,27 @@ function stripHeredocBodies(command: string): {
           j++;
         }
       }
+      // N1: an empty QUOTED delimiter (`<<''`) is a real delimiter whose
+      // value is "" (body ends at an empty line) — distinct from no word.
+      if (j === wordStart) continue;
       const word = evaluateShellWord(line.slice(wordStart, j));
-      if (word) delimiters.push({ word, dash, quoted });
+      const id = nextId++;
+      delimiters.push({ id, word, dash, quoted });
+      bodies[id] = "";
+      if (!quoted) markers.push(`${HEREDOC_SUB_MARK}${id}`);
       i = j - 1;
     }
+    out.push(...markers, line);
   }
   // A body left open at EOF has no provable boundary — still surface its
   // substitutions for analysis, but mark the command undeterminable (Q2).
   const unterminated = delimiters.length > 0;
-  if (unterminated && bodyLines.length > 0) closeBody(delimiters[0].quoted);
-  return { text: out.join("\n"), unterminated };
+  for (const d of delimiters) {
+    if (!d.quoted) {
+      substitutionBodies[d.id] = findHeredocSubstitutions(bodies[d.id] ?? "").join("\n");
+    }
+  }
+  return { text: out.join("\n"), substitutionBodies, unterminated };
 }
 
 /** Split at ;, &&, ||, newline, bare & and parens — but NOT single `|`
@@ -1460,6 +1472,14 @@ export function commandFileTargets(
     }
     const executableCommand = stripShellSubstitutions(entry.text, substitutions);
     for (const group of commandGroups(executableCommand)) {
+      // Q1: a heredoc-substitution marker starts an independent unit whose
+      // cwd is the declaration point — its cd's stay inside the unit.
+      if (group.trim().startsWith(HEREDOC_SUB_MARK)) {
+        const id = Number(group.trim().slice(HEREDOC_SUB_MARK.length));
+        const body = stripped.substitutionBodies[id];
+        if (body) pending.push({ text: body, cwd: currentCwd, cwdKnown });
+        continue;
+      }
       const stages = pipeStages(group);
       for (const stage of stages) {
         const invocation = commandAndArgs(stage);
@@ -1844,7 +1864,7 @@ export function normalize(cmd: string): string {
 export function analyzeCommand(cmd: string): DangerAnalysis {
   const behaviorSet = new Set<string>();
   const stripped = stripHeredocBodies(String(cmd ?? ""));
-  const pending = [stripped.text];
+  const pending = [stripped.text, ...stripped.substitutionBodies.filter(Boolean)];
 
   while (pending.length > 0) {
     const command = normalize(pending.pop() ?? "");
@@ -1855,6 +1875,7 @@ export function analyzeCommand(cmd: string): DangerAnalysis {
     const syntax = stripQuotedShellData(executableCommand);
 
     for (const group of commandGroups(executableCommand)) {
+      if (group.trim().startsWith(HEREDOC_SUB_MARK)) continue; // analyzed separately
       const stages = pipeStages(group);
 
       // remote-fetch-exec is judged on truly ADJACENT pairs (R1): a
@@ -2080,6 +2101,12 @@ export function analyzeBashOperation(
     }
     const executableCommand = stripShellSubstitutions(entry.text, substitutions);
     for (const group of commandGroups(executableCommand)) {
+      if (group.trim().startsWith(HEREDOC_SUB_MARK)) {
+        const id = Number(group.trim().slice(HEREDOC_SUB_MARK.length));
+        const body = stripped.substitutionBodies[id];
+        if (body) pending.push({ text: body, cwd: currentCwd, cwdKnown });
+        continue;
+      }
       for (const stage of pipeStages(group)) {
         const invocation = commandAndArgs(stage);
         if (!invocation) continue;

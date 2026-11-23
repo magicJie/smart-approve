@@ -1255,3 +1255,51 @@ test("delimiter quoting forms and per-entry quoted state (Q3)", () => {
   assert.ok(values.includes("/tmp/first"), "first body target present");
   assert.ok(!values.includes("/tmp/second"), "second body is data");
 });
+
+test("heredoc substitutions are independent units at declaration-time cwd (Q1-final)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smart-approve-q1f-"));
+  try {
+    fs.mkdirSync(path.join(dir, "sub"));
+    // ① cd INSIDE the substitution stays in the subshell: the parent
+    // command after the body still reads `later` at the original cwd.
+    const a = commandFileTargets(
+      "cat <<EOF\n$(cd sub; cat note)\nEOF\ncat later\n",
+      dir,
+    );
+    const av = a.targets.map((t) => `${t.cwd}|${t.value}`);
+    assert.ok(av.includes(`${path.join(dir, "sub")}|note`), `sub/note in ${av}`);
+    assert.ok(av.includes(`${dir}|later`), `parent later in ${av}`);
+
+    // ② A cd AFTER the declaration on the same line can't reach back into
+    // the body: the substitution reads `note` at declaration cwd, while the
+    // later parent command reads sub/later.
+    const b = commandFileTargets(
+      "cat <<EOF; cd sub; cat later\n$(cat note)\nEOF\n",
+      dir,
+    );
+    const bv = b.targets.map((t) => `${t.cwd}|${t.value}`);
+    assert.ok(bv.includes(`${dir}|note`), `declaration-cwd note in ${bv}`);
+    assert.ok(bv.includes(`${path.join(dir, "sub")}|later`), `sub/later in ${bv}`);
+
+    // ③ Existing behavior: cd BEFORE the declaration still applies.
+    const c = commandFileTargets(
+      "cd sub\ncat <<EOF\n$(cat f)\nEOF\n",
+      dir,
+    );
+    assert.ok(c.targets.some((t) => t.cwd === path.join(dir, "sub") && t.value === "f"));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("empty quoted delimiter ends at an empty line, body stays literal (N1)", () => {
+  const r = commandFileTargets(
+    "cat <<''\n$(rm -rf /tmp/x)\n\nsort after.tsv\n",
+    "/tmp",
+  );
+  assert.deepEqual(r.targets.map((t) => t.value), ["after.tsv"]);
+  assert.equal(r.undeterminable, false, "empty quoted delimiter still terminates");
+  const behavior = analyzeCommand("cat <<''\n$(rm -rf /tmp/x)\n\n");
+  assert.ok(!behavior.behaviors.includes("recursive-force-delete"),
+    "empty quoted delimiter body is literal data");
+});
