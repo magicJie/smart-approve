@@ -875,7 +875,10 @@ test("attached option values and input redirection are file targets", () => {
   assert.deepEqual(input.targets.map((t) => t.value), ["in.tsv"]);
   assert.equal(input.undeterminable, false);
   // Heredocs and fd duplications are not file targets.
-  assert.equal(commandFileTargets("cat <<EOF", "/tmp").undeterminable, false);
+  // Z1b: an unterminated heredoc has no provable body boundary →
+  // undeterminable; a closed one is clean.
+  assert.equal(commandFileTargets("cat <<EOF", "/tmp").undeterminable, true);
+  assert.equal(commandFileTargets("cat <<EOF\nx\nEOF", "/tmp").undeterminable, false);
   assert.equal(commandFileTargets("cat <&3", "/tmp").undeterminable, false);
   // A redirection with no readable target cannot prove domain membership.
   assert.equal(commandFileTargets("cat < ", "/tmp").undeterminable, true);
@@ -1143,4 +1146,56 @@ test("left descriptor value decides combined-write validity (Z3)", () => {
   // fd duplications stay target-free for every descriptor.
   assert.deepEqual(commandFileTargets("echo hi 1>&2", "/tmp").targets, []);
   assert.deepEqual(commandFileTargets("echo hi 2>&1", "/tmp").targets, []);
+});
+
+test("heredoc delimiters match by evaluated word value (Z1a)", () => {
+  // `<<\EOF` closes on a plain EOF line — the next command is analyzed.
+  const esc = commandFileTargets(
+    "cat <<\\EOF\nrm -rf /\nEOF\nsort after.tsv\n",
+    "/tmp",
+  );
+  assert.deepEqual(esc.targets.map((t) => t.value), ["after.tsv"]);
+  assert.equal(esc.undeterminable, false, "delimiter matched, body terminated");
+  // Quoted delimiter with a backslash keeps the literal backslash in the
+  // word: only `E\OF` closes it, and a following command still counts.
+  const lit = commandFileTargets(
+    "cat <<'E\\OF'\nwhatever\nE\\OF\nsort real.tsv\n",
+    "/tmp",
+  );
+  assert.deepEqual(lit.targets.map((t) => t.value), ["real.tsv"]);
+  assert.equal(lit.undeterminable, false);
+});
+
+test("unquoted heredoc bodies execute their substitutions; quoted stay data (Z1b)", () => {
+  // $(rm -rf ...) in an UNQUOTED heredoc body really runs in bash.
+  const live = analyzeCommand("cat <<EOF\n$(rm -rf /tmp/x)\nEOF\n");
+  assert.ok(live.behaviors.includes("recursive-force-delete"),
+    "unquoted body substitution must be analyzed");
+  // The same text in a QUOTED heredoc is literal data.
+  const data = analyzeCommand("cat <<'EOF'\n$(rm -rf /tmp/x)\nEOF\n");
+  assert.ok(!data.behaviors.includes("recursive-force-delete"),
+    "quoted body substitution is data");
+  // Backticks in an unquoted body also execute.
+  const bt = analyzeCommand("cat <<EOF\n`rm -rf /tmp/y`\nEOF\n");
+  assert.ok(bt.behaviors.includes("recursive-force-delete"));
+  // Targets after the body are still extracted; substitution payload makes
+  // the domain check undeterminable rather than silently clean.
+  const targets = commandFileTargets(
+    "cat <<EOF\n$(rm -rf /tmp/x)\nEOF\nsort after.tsv\n",
+    "/tmp",
+  );
+  assert.ok(targets.targets.some((t) => t.value === "after.tsv"));
+  // An unterminated body is undeterminable.
+  assert.equal(commandFileTargets("cat <<EOF\nnever closed\n", "/tmp").undeterminable, true);
+});
+
+test("fd numbers compare by value; input dup of a file is invalid (Z1c)", () => {
+  // 01 is stdout in bash — a legal combined write.
+  const r = commandFileTargets("echo hi 01>&file.txt", "/tmp");
+  assert.deepEqual(r.targets.map((t) => t.value), ["file.txt"]);
+  assert.equal(r.undeterminable, false);
+  // `<&file.txt` has no combined-write form — no write target, undeterminable.
+  const input = commandFileTargets("cat <&file.txt", "/tmp");
+  assert.deepEqual(input.targets, []);
+  assert.equal(input.undeterminable, true);
 });

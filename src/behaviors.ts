@@ -636,9 +636,11 @@ function redirectionTargets(
       // prefix or an explicit stdout `1>&file`; any other descriptor
       // (`2>&file`) is "ambiguous redirect" — undeterminable, not a
       // fabricated file target (Z3).
-      const combinedOk = ch === ">"
-        ? !leftFd || leftFdDigits === "1"
-        : !leftFd;
+      // Z1c: fd numbers compare by VALUE (`01` ≡ `1`).  The input direction
+      // has no combined-write form at all — `<&file` is an invalid fd
+      // duplication, never a write target.
+      const combinedOk = ch === ">" &&
+        (!leftFd || Number.parseInt(leftFdDigits, 10) === 1);
       if (!combinedOk) {
         incomplete = true;
         index = cursor - 1;
@@ -747,20 +749,46 @@ function pathArg(rawToken: string | undefined): PathArg {
 }
 
 /** Remove heredoc bodies so their literal text never becomes commands or
- *  file targets (X4).  Returns the command with each heredoc's body lines —
- *  and its terminating delimiter — dropped; everything after the body
- *  (other lines, or the tail of the operator line) is untouched. */
-function stripHeredocBodies(command: string): string {
+ *  file targets (X4/Z1).  Returns the stripped command plus, for UNQUOTED
+ *  delimiters, the command substitutions the body would actually execute
+ *  (bash expands `$VAR`, `$(cmd)`, backticks in an unquoted heredoc body —
+ *  Z1b); quoted-delimiter bodies are pure data.  `unterminated` marks a
+ *  heredoc whose closing delimiter never appeared: the body boundary can't
+ *  be proven, so callers must treat the command as undeterminable. */
+function stripHeredocBodies(command: string): {
+  text: string;
+  substitutionBodies: string[];
+  unterminated: boolean;
+} {
   const lines = command.split("\n");
   const out: string[] = [];
   const delimiters: { word: string; dash: boolean; quoted: boolean }[] = [];
+  const substitutionBodies: string[] = [];
   let quote: string | undefined; // carried across lines (multi-line strings)
+  let currentBody: string[] | undefined;
+  let currentQuoted = false;
+
+  const finishBody = (): void => {
+    if (currentBody && !currentQuoted) {
+      // Only the substitutions execute — the rest of the body is data, so
+      // we extract $(...) / `...` bodies instead of analyzing the raw text.
+      for (const sub of findShellSubstitutions(currentBody.join("\n"))) {
+        substitutionBodies.push(sub.body);
+      }
+    }
+    currentBody = undefined;
+  };
 
   for (const line of lines) {
     if (delimiters.length > 0) {
       const current = delimiters[0];
       const candidate = current.dash ? line.replace(/^\t+/, "") : line;
-      if (candidate === current.word) delimiters.shift();
+      if (candidate === current.word) {
+        delimiters.shift();
+        finishBody();
+      } else {
+        (currentBody ??= []).push(line);
+      }
       continue; // body line (or the closing delimiter) — never a command
     }
     out.push(line);
@@ -789,22 +817,35 @@ function stripHeredocBodies(command: string): string {
       let dash = false;
       if (line[j] === "-" || line[j] === "~") { dash = line[j] === "-"; j++; }
       while (line[j] === " " || line[j] === "\t") j++;
-      let word = "";
+      // Capture the RAW delimiter word (quotes/backslashes intact) then
+      // store its evaluated value — `<<\EOF` and `<<EOF` share the closing
+      // line EOF, while `<<'E\OF'` keeps its literal backslash (Z1a).
+      const wordStart = j;
       let quoted = false;
       if (line[j] === "'" || line[j] === "\"") {
-        quoted = true; // quoted delimiter → the body is NOT expanded
+        quoted = true;
         const q = line[j];
         j++;
-        while (j < line.length && line[j] !== q) word += line[j++];
+        while (j < line.length && line[j] !== q) j++;
         if (line[j] === q) j++;
       } else {
-        while (j < line.length && !/[\s;&|()<>\n]/.test(line[j])) word += line[j++];
+        while (j < line.length && !/[\s;&|()<>\n]/.test(line[j])) {
+          if (line[j] === "\\" && j + 1 < line.length) j++;
+          j++;
+        }
       }
-      if (word) delimiters.push({ word, dash, quoted });
+      const word = evaluateShellWord(line.slice(wordStart, j));
+      if (word) {
+        delimiters.push({ word, dash, quoted });
+        currentQuoted = quoted;
+        currentBody = [];
+      }
       i = j - 1;
     }
   }
-  return out.join("\n");
+  // Any body left open at EOF has no provable boundary (Z1b).
+  const unterminated = delimiters.length > 0;
+  return { text: out.join("\n"), substitutionBodies, unterminated };
 }
 
 /** Split at ;, &&, ||, newline, bare & and parens — but NOT single `|`
@@ -1374,9 +1415,16 @@ export function commandFileTargets(
   let currentCwd = cwd;
   let cwdKnown = true;
 
+  const stripped = stripHeredocBodies(command);
   const pending: { text: string; cwd: string; cwdKnown: boolean }[] = [
-    { text: normalize(stripHeredocBodies(command)), cwd, cwdKnown: true },
+    { text: normalize(stripped.text), cwd, cwdKnown: true },
   ];
+  // Unquoted heredoc bodies execute their substitutions (Z1b) — re-analyze
+  // those bodies as real commands; an unterminated body is undeterminable.
+  let heredocUndeterminable = stripped.unterminated;
+  for (const body of stripped.substitutionBodies) {
+    pending.push({ text: body, cwd, cwdKnown: true });
+  }
   while (pending.length > 0) {
     const entry = pending.pop()!;
     currentCwd = entry.cwd;
@@ -1461,7 +1509,7 @@ export function commandFileTargets(
     seen.add(key);
     return true;
   });
-  return { targets: unique, undeterminable };
+  return { targets: unique, undeterminable: undeterminable || heredocUndeterminable };
 }
 
 
@@ -1771,7 +1819,8 @@ export function normalize(cmd: string): string {
  */
 export function analyzeCommand(cmd: string): DangerAnalysis {
   const behaviorSet = new Set<string>();
-  const pending = [stripHeredocBodies(String(cmd ?? ""))];
+  const stripped = stripHeredocBodies(String(cmd ?? ""));
+  const pending = [stripped.text, ...stripped.substitutionBodies];
 
   while (pending.length > 0) {
     const command = normalize(pending.pop() ?? "");
@@ -1990,8 +2039,10 @@ export function analyzeBashOperation(
   const behaviorSet = new Set(analysis.behaviors);
   let currentCwd = cwd;
   let cwdKnown = true;
+  const stripped = stripHeredocBodies(command);
   const pending: { text: string; cwd: string; cwdKnown: boolean }[] = [
-    { text: normalize(stripHeredocBodies(command)), cwd, cwdKnown: true },
+    { text: normalize(stripped.text), cwd, cwdKnown: true },
+    ...stripped.substitutionBodies.map((body) => ({ text: body, cwd, cwdKnown: true })),
   ];
   while (pending.length > 0) {
     const entry = pending.pop()!;
