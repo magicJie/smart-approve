@@ -365,3 +365,27 @@ $ bun run build       # dist/index.js 221.59 KB
 ```
 
 **偏差**：无。
+
+## 十八、复审修正 R12（对应 REVIEW.md「第十二轮终审 · 25db8a4」R1–R3/N1）
+
+复审对象：`25db8a4`。本轮 R1/R2/R3 必修 + N1（非阻断）交付。
+
+| 项 | 修正 | 断言 |
+|----|------|------|
+| R1（展开归属命令段 + 独立 cwd） | `splitHeredocWork` 按行产出工作项，扫描器同步跟踪命令组索引（与 `commandGroups` 分隔规则一致：`;`/`&&`/`\|\|`/裸 `&`/括号，管道不跨组）；每处替换绑定**拥有该重定向的命令段组索引**，walker 在该组处理前把替换体作为独立 pending 单元注入——`cd sub && cat <<EOF` 的展开在 `sub` 下进行；同一正文多处替换各自独立目录状态 | `heredoc expansions bind to the owning segment's cwd, each independent (R1)` 五组对照全表：① 替换内 cd 不泄漏、② 声明行后 cd 不回溯、③ 先 cd 再声明、④ 同行 `cd sub && cat <<EOF` 展开在 sub、⑤ 同正文两处替换互不影响 |
+| R2（未知目录相对目标） | `commandFileTargets` 在 `cwdKnown=false` 时跳过相对目标登记并置 undeterminable，不再用旧 currentCwd 得出确定路径；域检查/gate 据此回普通审批 | `unknown cwd makes relative targets undeterminable (R2)`：`cd "$SUB"; cat note` 无目标且 undeterminable |
+| R3（带类型内部记录） | 文本标记 `__SA_HEREDOC_SUB__` 全部移除，改为 `HeredocWorkItem { text, expansions: { group, bodies }[] }` 带类型工作记录；三个 walker（`analyzeCommand`/`analyzeBashOperation`/`commandFileTargets`）按记录驱动，不存在内部标记与用户文本冲突面 | 全部 275 用例（含 R1 五组）通过；无标记相关代码残留 |
+| N1（末尾空片段 ≠ 空行） | `splitHeredocWork` 在 `split("\n")` 后丢弃末尾空片段——以换行结束但没有真正空行的 heredoc 判未闭合（Bash missing delimiter） | `a trailing newline is not a blank line for heredoc termination (N1)`：`cat <<''\nbody\n` 未闭合 undeterminable；有真空行时闭合且后续 `sort after.tsv` 计入 |
+
+**复审修正 R12 后验证**：
+
+```
+$ bun run typecheck   # tsc --noEmit → clean
+$ bun test src
+ 275 pass
+ 0 fail
+Ran 275 tests across 14 files.
+$ bun run build       # dist/index.js 222.92 KB
+```
+
+**偏差**：无。
