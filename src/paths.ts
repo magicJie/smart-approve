@@ -182,11 +182,15 @@ function splitCommandSegments(value: string): string[] {
       continue;
     }
     if (ch === "&" || (ch === "|")) {
-      // `>&` / `<&` fd duplications are redirection syntax — not separators.
+      // `>&` / `<&` fd duplications and `&>` / `&>>` combined redirects are
+      // redirection syntax — not command separators.
       if (ch === "&" && (value[i - 1] === ">" || value[i - 1] === "<")) continue;
+      if (ch === "&" && value[i + 1] === ">") continue;
+      if (ch === "|" && value[i - 1] === ">") continue; // `>|` is redirection
       const segment = value.slice(start, i).trim();
       if (segment) result.push(segment);
       if (value[i + 1] === ch) i++;
+      if (ch === "|" && value[i + 1] === "&") i++; // `|&` stderr pipe
       start = i + 1;
     }
   }
@@ -377,7 +381,11 @@ export function expandHomeLiteral(value: string, home: string): string | undefin
   let expanded = value;
   if (!expanded) return undefined;
   if (expanded === "~") expanded = home;
-  else if (expanded.startsWith("~/")) expanded = path.join(home, expanded.slice(2));
+  else if (expanded.startsWith("~/")) {
+    // Prefix substitution, NOT path.join: keep the original components
+    // (incl. "..") so the realpath walk still sees them (V4).
+    expanded = home + expanded.slice(1);
+  }
   else if (expanded.startsWith("~")) return undefined; // ~user needs a lookup
   const placeholder = "\0HOME\0";
   expanded = expanded
@@ -404,7 +412,7 @@ export function resolveFilesystemPathCandidates(
     : filePath === "~"
       ? home
       : filePath.startsWith("~/")
-        ? path.join(home, filePath.slice(2))
+        ? home + filePath.slice(1) // keep ".." components for the realpath walk (V4)
         : filePath;
   const absolutePath = path.resolve(baseCwd, expanded);
   const missingSegments: string[] = [];
@@ -445,7 +453,7 @@ export function semanticPathCandidates(
   const expandHome = options.expandHome !== false;
   const expandedTarget = !expandHome ? target
     : target === "~" ? home
-    : target.startsWith("~/") ? path.join(home, target.slice(2))
+    : target.startsWith("~/") ? home + target.slice(1) // keep ".." components (V4)
     : target;
   if (!path.isAbsolute(expandedTarget) && !path.isAbsolute(baseCwd)) return lexical;
   const absolute = path.isAbsolute(expandedTarget) ? expandedTarget : `${baseCwd}/${expandedTarget}`;

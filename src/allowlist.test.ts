@@ -426,3 +426,55 @@ test("write/edit domain targets resolve .. through symlinks (no early path.resol
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("unresolvable domain roots grant nothing, even from the entry cwd (V3)", () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "smart-approve-vdom-"));
+  const domain = path.join(root, "a");
+  try {
+    fs.mkdirSync(domain);
+    fs.writeFileSync(path.join(domain, "note"), "x");
+    for (const bad of ["", "$SOME_UNSET_VAR", "~definitely-no-such-user-xyz"]) {
+      const { list } = makeList([
+        { tool: "write", key: "__domain-only__", cwd: domain, timestamp: "t", domain: bad },
+      ]);
+      assert.equal(list.isAllowed("write", "note", domain), false,
+        `domain ${JSON.stringify(bad)} must not resolve against cwd`);
+    }
+    // A valid ~ domain still matches its own files.
+    const { list: home } = makeList([
+      { tool: "write", key: "__domain-only__", cwd: domain, timestamp: "t", domain: "~" },
+    ]);
+    assert.equal(home.isAllowed("write", `${os.homedir()}/note`, domain), true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("home-prefixed targets keep original components through symlinked dirs (V4)", () => {
+  // Build the scenario inside the real home so a ~/ domain applies.
+  const root = fs.mkdtempSync(path.join(os.homedir(), ".smart-approve-v4-"));
+  const domain = path.join(root, "a");
+  try {
+    fs.mkdirSync(domain);
+    fs.writeFileSync(path.join(root, "note"), "B");
+    fs.symlinkSync("/etc", path.join(domain, "l"));
+    const { list } = makeList([
+      { tool: "write", key: "__domain-only__", cwd: domain, timestamp: "t", domain: "~" },
+    ]);
+    // Absolute, home-prefixed, and relative spellings of the SAME file must
+    // agree: l → /etc, .. → /, so the write lands on /note — outside ~.
+    const abs = `${domain}/l/../note`;
+    const homePref = `~${abs.slice(os.homedir().length)}`; // slice, not path.relative (which folds ..)
+    assert.equal(list.isAllowed("write", abs, domain), false, "absolute form");
+    assert.equal(list.isAllowed("write", homePref, domain), false,
+      "~/ form must keep the .. component (path.join would fold it away)");
+    assert.equal(list.isAllowed("write", "l/../note", domain), false, "relative form");
+    // Sanity: a real in-home file is still allowed by every spelling.
+    fs.writeFileSync(path.join(domain, "note"), "A");
+    assert.equal(list.isAllowed("write", `${domain}/note`, domain), true);
+    assert.equal(list.isAllowed("write", `~${path.join(domain, "note").slice(os.homedir().length)}`, domain), true);
+    assert.equal(list.isAllowed("write", "note", domain), true);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

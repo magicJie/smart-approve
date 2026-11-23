@@ -908,3 +908,56 @@ test("escaped tilde and dollar literals match their quoted forms (W4)", () => {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("redirect operator forms: >&file vs >&N, &>, and option clusters (V1)", () => {
+  // `>&file` writes to a file; `>&2` and `2>&1` are fd duplications.
+  assert.deepEqual(
+    commandFileTargets("echo hi >&out.log", "/tmp").targets.map((t) => t.value),
+    ["out.log"],
+    ">&file is a file target",
+  );
+  assert.deepEqual(commandFileTargets("echo hi >&2", "/tmp").targets, [], ">&2 is an fd dup");
+  assert.deepEqual(commandFileTargets("echo hi 2>&1", "/tmp").targets, [], "2>&1 is an fd dup");
+  assert.deepEqual(commandFileTargets("echo hi 2>&-", "/tmp").targets, [], "2>&- closes an fd");
+  // `&>` combined redirect — the & must not split the command.
+  assert.deepEqual(
+    commandFileTargets("make &>build.log", "/tmp").targets.map((t) => t.value),
+    ["build.log"],
+  );
+  // Clustered sort options: -r + -oout ≡ -o out.
+  assert.deepEqual(
+    commandFileTargets("sort -roout.tsv in.tsv", "/tmp").targets.map((t) => t.value).sort(),
+    commandFileTargets("sort -o out.tsv in.tsv", "/tmp").targets.map((t) => t.value).sort(),
+  );
+  // Unknown cluster characters can't be fully understood.
+  assert.equal(commandFileTargets("sort -rx in.tsv", "/tmp").undeterminable, true);
+  assert.equal(commandFileTargets("sort -rn in.tsv", "/tmp").undeterminable, false);
+});
+
+test("redirect read/write semantics: input reads never look like writes (V2)", () => {
+  // A read from a sensitive path must NOT trip write-sensitive-file.
+  const read = analyzeBashOperation("cat < /proc/uptime", "/tmp", "/tmp");
+  assert.ok(!read.behaviors.includes("write-sensitive-file"),
+    "< /proc/... is a read, not a write");
+  // The same path via output redirection is a write and stays classified.
+  const write = analyzeBashOperation("echo 1 > /proc/sysrq-trigger", "/tmp", "/tmp");
+  assert.ok(write.behaviors.includes("write-sensitive-file"));
+  const dup = analyzeBashOperation("echo 1 2>&1", "/tmp", "/tmp");
+  assert.ok(!dup.behaviors.includes("write-sensitive-file"), "fd dup has no file target");
+  // Heredoc delimiter words are data — not filesystem targets.
+  const heredoc = commandFileTargets("cat <<END\n/proc/uptime\nEND", "/tmp");
+  assert.equal(heredoc.undeterminable, false);
+  assert.ok(!heredoc.targets.some((t) => t.value === "END" || t.value === "/proc/uptime"),
+    "heredoc delimiter/body are not targets");
+  const heredocIn = commandFileTargets("cat <<END", "/tmp");
+  assert.deepEqual(heredocIn.targets, []);
+});
+
+test("mixed escape + dynamic remainder is undeterminable, not frozen (V5)", () => {
+  const mixed = commandFileTargets("echo hi >\\~$VAR", "/tmp");
+  assert.equal(mixed.undeterminable, true, "\\~$VAR must not be frozen as a literal");
+  // A plain escaped literal stays a literal.
+  const plain = commandFileTargets("echo hi >\\~file", "/tmp");
+  assert.deepEqual(plain.targets.map((t) => t.value), ["~file"]);
+  assert.equal(plain.undeterminable, false);
+});

@@ -527,16 +527,19 @@ function hasSensitiveAccountFileReference(name: string, args: string[]): boolean
 
 
 
-/** Raw redirection targets per stage — input (`<`) and output (`>`) targets
- *  alike; the token is returned verbatim (quotes intact) so the caller can
- *  honor literal quoting via pathArg (R6).  `incomplete` is set when a
- *  redirection operator has no recognizable target — heredocs/here-strings
- *  and fd duplications (`<<`, `<<<`, `>&`, `<&`) have no filesystem target
- *  and do not set it. */
+/** Redirection targets per stage, with read/write semantics preserved.
+ *  `<` is a read, `>`/`>>`/`&>`/`&>>`/`>`/`<>` are writes.  `>&word` /
+ *  `<&word` are fd duplications (no filesystem target) only when word is a
+ *  digit or `-`; bash's `>&file` writes to file.  Heredocs/here-strings
+ *  (`<<`, `<<-`, `<<<`) carry data, not paths — their delimiter word is not
+ *  a target.  Targets keep quotes intact so the caller can honor literal
+ *  quoting via pathArg (R6); `incomplete` marks an operator whose target
+ *  can't be recognized → the caller must treat the command as
+ *  undeterminable. */
 function redirectionTargets(
   segment: string,
-): { targets: string[]; incomplete: boolean } {
-  const targets: string[] = [];
+): { targets: { raw: string; write: boolean }[]; incomplete: boolean } {
+  const targets: { raw: string; write: boolean }[] = [];
   let incomplete = false;
   let quote: string | undefined;
   let escaped = false;
@@ -560,14 +563,38 @@ function redirectionTargets(
     if (ch !== ">" && ch !== "<") continue;
 
     let cursor = index + 1;
-    if (segment[cursor] === ch) cursor++; // `>>` / `<<` — heredoc handled below
-    if (ch === "<" && segment[cursor] === "<") cursor++; // `<<<` here-string
-    const isHeredoc = ch === "<" && cursor - index >= 2;
-    const isDup = segment[cursor] === "&";
-    const isRW = ch === "<" && segment[cursor] === ">" && cursor === index + 1;
-    if (isRW) cursor++;
-    if (segment[cursor] === "|") continue;
-    if (isHeredoc || isDup) continue; // delimiter word / fd — no path target
+    let write = ch === ">";
+    if (segment[cursor] === ch) cursor++; // `>>` / `<<`
+    if (ch === "<") {
+      if (segment[cursor] === "<") cursor++; // `<<<` here-string
+      const isHeredoc = cursor - index >= 2;
+      if (segment[cursor] === "-" || segment[cursor] === "~") cursor++; // `<<-`, `<<~`
+      if (isHeredoc) {
+        index = cursor - 1; // skip operator; delimiter word is data, not a path
+        continue;
+      }
+      if (segment[cursor] === ">") { // `<>` read-write
+        cursor++;
+        write = true;
+      }
+    }
+    if (segment[cursor] === "|") { // `>|` noclobber override — still a write
+      cursor++;
+      write = true;
+    }
+    if (segment[cursor] === "&") {
+      // `n>&word` / `n<&word`: an fd duplication only when word is a digit
+      // or `-`; anything else is bash's `>&file` combined-stdout write.
+      const dupEnd = cursor + 1;
+      let wordEnd = dupEnd;
+      while (wordEnd < segment.length && /\d/.test(segment[wordEnd])) wordEnd++;
+      if (wordEnd > dupEnd || segment[dupEnd] === "-") {
+        index = wordEnd > dupEnd ? wordEnd - 1 : dupEnd; // skip fd word
+        continue;
+      }
+      cursor++; // `>&file` / `<&file` — treat as a file target
+      write = true; // conservative: even a weird <&file counts as a write
+    }
     while (/\s/.test(segment[cursor] ?? "")) cursor++;
 
     const start = cursor;
@@ -585,7 +612,7 @@ function redirectionTargets(
       }
     }
     const target = segment.slice(start, cursor);
-    if (target) targets.push(target);
+    if (target) targets.push({ raw: target, write });
     else incomplete = true;
     index = cursor - 1;
   }
@@ -666,7 +693,12 @@ function pathArg(rawToken: string | undefined): PathArg {
   // `"\$` inside double quotes, is an ordinary character the shell would
   // never expand — the unescaped value must not be expanded either (W4).
   // Only the LEADING position matters: `~/\~x` still expands its home prefix.
-  const escapedLiteral = /^\\[~$]/.test(raw) || /^"\\[$]/.test(raw);
+  // And the escape covers only that one character — a remainder that still
+  // holds an unescaped `$`/backtick is dynamic, not a frozen literal (V5):
+  // `\~$VAR` must come back undeterminable, not a file literally named
+  // `~$VAR`.
+  const dynamicRemainder = /[$`]/.test(value.slice(1));
+  const escapedLiteral = (/^\\[~$]/.test(raw) || /^"\\[$]/.test(raw)) && !dynamicRemainder;
   const literal = singleQuoted || escapedLiteral || (doubleQuoted && /^~($|\/)/.test(value));
   return { value, literal };
 }
@@ -695,8 +727,10 @@ function commandGroups(command: string): string[] {
       continue;
     }
     if (ch === "&") {
-      // `>&` / `<&` fd duplications are redirection syntax — not separators.
+      // `>&` / `<&` fd duplications and `&>` / `&>>` combined redirects are
+      // redirection syntax — not command separators.
       if (command[i - 1] === ">" || command[i - 1] === "<") continue;
+      if (command[i + 1] === ">") continue;
       const segment = command.slice(start, i).trim();
       if (segment) result.push(segment);
       if (command[i + 1] === "&") i++;
@@ -730,8 +764,10 @@ function pipeStages(group: string): string[] {
       continue;
     }
     if (ch === "'" || ch === "\"" || ch === "`") { quote = ch; continue; }
+    if (ch === "|" && group[i - 1] === ">") continue; // `>|` is redirection
     if (ch === "|" && group[i + 1] !== "|") {
       result.push(group.slice(start, i).trim());
+      if (group[i + 1] === "&") i++; // `|&` stderr pipe
       start = i + 1;
     }
   }
@@ -952,6 +988,14 @@ const FILE_OPTION_VALUE: Record<string, ReadonlySet<string>> = {
   ssh: new Set(["-i", "-F"]),
 };
 
+/** Boolean short flags (no value) for tools whose option grammar I scan
+ *  cluster-by-cluster.  An unrecognized cluster character means the
+ *  combination can't be fully understood → undeterminable (V1). */
+const SHORT_FLAGS: Record<string, ReadonlySet<string>> = {
+  sort: new Set(["-b", "-c", "-C", "-d", "-f", "-g", "-h", "-i", "-M",
+    "-n", "-R", "-r", "-s", "-u", "-V", "-z", "-m"]),
+};
+
 /** Options that take a non-file value — skipped wholesale. */
 const NONFILE_OPTION_VALUE: Record<string, ReadonlySet<string>> = {
   curl: new Set(["-A", "--user-agent", "-H", "--header", "-d", "--data",
@@ -1020,8 +1064,14 @@ function stagePathArgs(
       continue;
     }
     // Redirection operators (`<`, `>`, `2>`-prefixed, `<>`, `>&fd`) are
-    // syntax, not operands; the target itself is counted separately.
-    if (/^\d*[<>]/.test(arg)) { i++; continue; }
+    // syntax, not operands; the target itself is counted separately.  A
+    // heredoc's delimiter word (the token after `<<`/`<<-`/`<<<`) is data,
+    // not a path (V1/V2).
+    if (/^\d*[<>]/.test(arg)) {
+      const heredocOp = /^\d*<<[-~]?$/.test(arg);
+      i += heredocOp ? 2 : 1;
+      continue;
+    }
     operands.push(pathArg(raw));
     i++;
   }
@@ -1067,6 +1117,30 @@ function stageFileOptionTargets(
         continue;
       }
       if (nonfileOpts?.has(opt)) { i++; continue; }
+      // General cluster scan (`-roout` = -r + -oout).  Flags advance; a
+      // value-taking option consumes the rest of the cluster (or the next
+      // token).  An unrecognized character → undeterminable (V1).
+      if (SHORT_FLAGS[name]) {
+        let j = 1;
+        while (j < arg.length) {
+          const short = `-${arg[j]}`;
+          if (SHORT_FLAGS[name]?.has(short)) { j++; continue; }
+          if (fileOpts?.has(short)) {
+            if (j + 1 < arg.length) targets.push(pathArg(rawArgs[i].slice(j + 1)));
+            else if (rawArgs[i + 1] !== undefined) { targets.push(pathArg(rawArgs[i + 1])); i++; }
+            else complete = false;
+            break;
+          }
+          if (nonfileOpts?.has(short)) {
+            if (j + 1 >= arg.length) i++;
+            break;
+          }
+          complete = false;
+          break;
+        }
+        i++;
+        continue;
+      }
     }
     i++;
   }
@@ -1259,7 +1333,7 @@ export function commandFileTargets(
         // is the universal sink and carries no domain risk.
         const redirect = redirectionTargets(stage);
         if (redirect.incomplete) undeterminable = true;
-        for (const raw of redirect.targets) {
+        for (const { raw } of redirect.targets) {
           const expanded = expandPathTarget(pathArg(raw), home);
           if (expanded === undefined) {
             undeterminable = true;
@@ -1744,7 +1818,7 @@ export function analyzeCommand(cmd: string): DangerAnalysis {
         behaviorSet.add("kubectl-delete");
       }
 
-      for (const rawTarget of redirectionTargets(segment).targets) {
+      for (const { raw: rawTarget } of redirectionTargets(segment).targets.filter((t) => t.write)) {
         const target = unquoteToken(rawTarget);
         const normalized = target.replace(/\\/g, "/");
         const sensitiveSystemWrite =

@@ -104,9 +104,12 @@ export class AllowList {
   ): boolean {
     // The configured domain root is expanded once (~/, $HOME), then walked
     // with realpath semantics — the raw string never becomes a candidate
-    // (W3). Command targets arrive already expanded at the quoting boundary.
-    const domainRoot = expandHomeLiteral(entry.domain ?? "", process.env.HOME || os.homedir()) ?? "";
+    // (W3).  An empty or unresolvable (dynamic `~user`/`$VAR`) root means
+    // this entry grants nothing: normal approval, never a cwd fallback (V3).
+    const domainRoot = expandHomeLiteral(entry.domain ?? "", process.env.HOME || os.homedir());
+    if (!domainRoot) return false;
     const domain = semanticPathCandidates(domainRoot, entry.cwd, { expandHome: false });
+    if (domain.length === 0) return false;
     const withinDomain = (candidate: string): boolean =>
       domain.some((directory) =>
         candidate === directory ||
