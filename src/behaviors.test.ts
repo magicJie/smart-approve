@@ -1460,3 +1460,47 @@ test("continuation before the opening paren also binds the segment (U2)", () => 
   assert.equal(before.undeterminable, single.undeterminable);
   assert.ok(before.targets.some((t) => t.value === "note"));
 });
+
+test("continued declaration lines join their operands before the body starts (K1)", () => {
+  // `cat <<EOF \` + `note`: note is cat's OPERAND, not heredoc body.
+  const continued = commandFileTargets(
+    "cat <<EOF \\\nnote\nbody text\nEOF\n",
+    "/tmp",
+  );
+  const single = commandFileTargets(
+    "cat <<EOF note\nbody text\nEOF\n",
+    "/tmp",
+  );
+  assert.deepEqual(continued.targets, single.targets,
+    "continued and single-line declarations must agree");
+  assert.deepEqual(continued.targets.map((t) => t.value), ["note"]);
+  assert.equal(continued.undeterminable, single.undeterminable);
+  assert.equal(continued.undeterminable, false);
+});
+
+test("unquoted bodies fold continuations before the delimiter check (K2)", () => {
+  // Unquoted: `abc\` + `EOF` joins into one body line — the body ends only
+  // at the SECOND standalone EOF, so no extra commands are invented.
+  const unquoted = commandFileTargets(
+    "cat <<EOF\nabc\\\nEOF\ncat after\n",
+    "/tmp",
+  );
+  // The body here is unterminated (no second EOF) → undeterminable, and
+  // `cat after` is body text, not a command.
+  assert.equal(unquoted.undeterminable, true);
+  assert.deepEqual(unquoted.targets, []);
+  // With a real second EOF the body closes and `after` is a command.
+  const terminated = commandFileTargets(
+    "cat <<EOF\nabc\\\nEOF\nEOF\ncat after\n",
+    "/tmp",
+  );
+  assert.deepEqual(terminated.targets.map((t) => t.value), ["after"]);
+  assert.equal(terminated.undeterminable, false);
+  // Quoted: no joining — the first EOF closes the body, `after` runs.
+  const quoted = commandFileTargets(
+    "cat <<'EOF'\nabc\\\nEOF\ncat after\n",
+    "/tmp",
+  );
+  assert.deepEqual(quoted.targets.map((t) => t.value), ["after"]);
+  assert.equal(quoted.undeterminable, false);
+});

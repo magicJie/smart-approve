@@ -870,6 +870,11 @@ function splitHeredocWork(command: string): HeredocWork {
   let segmentHasContent = false;
   let hadHeredoc = false;
   let nextId = 0;
+  // K1: declarations wait until their command reaches a REAL newline — a
+  // continued declaration line keeps consuming command text (its operands
+  // belong to the declaration, not the body).
+  const pendingDeclarations: typeof delimiters = [];
+  let bodyContinued = false; // K2: previous unquoted body line ended in `\`
 
   const finishBody = (id: number, item: number, group: number, quoted: boolean): void => {
     if (quoted) return;
@@ -880,13 +885,21 @@ function splitHeredocWork(command: string): HeredocWork {
   for (const line of lines) {
     if (delimiters.length > 0) {
       const current = delimiters[0];
-      const candidate = current.dash ? line.replace(/^\t+/, "") : line;
-      if (candidate === current.word) {
-        finishBody(current.id, current.item, current.group, current.quoted);
-        delimiters.shift();
-      } else {
-        bodies[current.id] = (bodies[current.id] ? `${bodies[current.id]}\n` : "") + line;
+      // K2: in an UNQUOTED body a trailing backslash joins the next line
+      // into the same logical body line — a delimiter on that next line is
+      // body text, not a closing word.  Quoted bodies compare verbatim.
+      if (!bodyContinued) {
+        const candidate = current.dash ? line.replace(/^\t+/, "") : line;
+        if (candidate === current.word) {
+          finishBody(current.id, current.item, current.group, current.quoted);
+          delimiters.shift();
+          bodyContinued = false;
+          currentItem = undefined;
+          continue;
+        }
       }
+      bodies[current.id] = (bodies[current.id] ? `${bodies[current.id]}\n` : "") + line;
+      bodyContinued = !current.quoted && /(?:^|[^\\])(?:\\\\)*\\$/.test(line);
       currentItem = undefined; // the next real line starts a new command
       continue; // body line (or the closing delimiter) — never a command
     }
@@ -981,7 +994,7 @@ function splitHeredocWork(command: string): HeredocWork {
       // value is "" (body ends at an empty line) — distinct from no word.
       if (j === wordStart) continue;
       const word = evaluateShellWord(line.slice(wordStart, j));
-      delimiters.push({ id: nextId++, word, dash, quoted, item: itemIndex, group: groupIndex });
+      pendingDeclarations.push({ id: nextId++, word, dash, quoted, item: itemIndex, group: groupIndex });
       bodies[nextId - 1] = "";
       hadHeredoc = true;
       i = j - 1;
@@ -990,10 +1003,16 @@ function splitHeredocWork(command: string): HeredocWork {
     // A logical command continues while a quote is open or the scanner saw
     // a real trailing continuation — a comment's trailing backslash and a
     // literal `\\` pair do NOT continue (T2).
-    if (quote === undefined && !continued) currentItem = undefined;
+    if (quote === undefined && !continued) {
+      // The declaration command is complete — only NOW does the body start
+      // (K1).  A continued line's operands belonged to the declaration.
+      delimiters.push(...pendingDeclarations);
+      pendingDeclarations.length = 0;
+      currentItem = undefined;
+    }
   }
-  const unterminated = delimiters.length > 0;
-  for (const d of delimiters) finishBody(d.id, d.item, d.group, d.quoted);
+  const unterminated = delimiters.length > 0 || pendingDeclarations.length > 0;
+  for (const d of [...delimiters, ...pendingDeclarations]) finishBody(d.id, d.item, d.group, d.quoted);
   for (const exp of expansions) items[exp.item]?.expansions.push({ group: exp.group, bodies: exp.bodies });
 
   // Collapse continuations per COMMAND item only — heredoc bodies were
