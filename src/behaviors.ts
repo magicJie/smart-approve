@@ -9,7 +9,15 @@
 
 import type { DangerAnalysis } from "./types";
 import { makeLabel } from "./i18n";
-import { resolveFilesystemPathCandidates, semanticPathCandidates } from "./paths";
+import {
+  commandAndArgs,
+  isAssignment,
+  resolveFilesystemPathCandidates,
+  roughTokenize,
+  semanticPathCandidates,
+  unquoteToken,
+  type CommandInvocation,
+} from "./paths";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs";
@@ -115,20 +123,6 @@ const INTERPRETERS: Record<string, true> = {
   lua: true, tclsh: true, expect: true,
 };
 
-function unquoteToken(token: string): string {
-  if (
-    token.length >= 2 &&
-    ((token[0] === "'" && token[token.length - 1] === "'") ||
-      (token[0] === "\"" && token[token.length - 1] === "\""))
-  ) {
-    return token.slice(1, -1);
-  }
-  return token;
-}
-
-function isAssignment(token: string): boolean {
-  return /^[A-Za-z_][A-Za-z0-9_]*=/.test(unquoteToken(token));
-}
 /** Remove shell comments without treating `#` inside quotes as a comment. */
 function stripShellComments(command: string): string {
   let result = "";
@@ -331,91 +325,6 @@ function stripShellSubstitutions(
 }
 
 
-
-function commandAndArgs(
-  segment: string,
-  options: { unwrapXargs?: boolean } = {},
-): CommandInvocation | undefined {
-  const tokens = roughTokenize(segment);
-  let index = 0;
-
-  while (index < tokens.length) {
-    const token = unquoteToken(tokens[index]);
-    const name = path.basename(token).toLowerCase();
-    if (isAssignment(tokens[index]) || ["!", "if", "then", "do", "else", "elif"].includes(name)) {
-      index++;
-      continue;
-    }
-    if (name === "env") {
-      index++;
-      while (index < tokens.length) {
-        const option = unquoteToken(tokens[index]);
-        if (isAssignment(tokens[index])) {
-          index++;
-          continue;
-        }
-        if (option === "--") {
-          index++;
-          break;
-        }
-        if (!option.startsWith("-")) break;
-        index++;
-        if (["-u", "--unset", "-C", "--chdir"].includes(option) && index < tokens.length) index++;
-      }
-      continue;
-    }
-    if (name === "xargs" && options.unwrapXargs !== false) {
-      index++;
-      while (index < tokens.length) {
-        const option = unquoteToken(tokens[index]);
-        if (option === "--") {
-          index++;
-          break;
-        }
-        if (!option.startsWith("-")) break;
-        index++;
-        if (
-          ["-E", "--eof", "-I", "--replace", "-L", "--max-lines", "-n", "--max-args",
-            "-P", "--max-procs", "-s", "--max-chars", "-d", "--delimiter", "-a", "--arg-file"].includes(option) &&
-          index < tokens.length
-        ) {
-          index++;
-        }
-      }
-      continue;
-    }
-    if (["command", "exec", "nohup", "time", "setsid"].includes(name)) {
-      index++;
-      if (["command", "time"].includes(name) && tokens[index] === "-p") index++;
-      if (name === "setsid" && tokens[index] === "-f") index++;
-      if (tokens[index] === "--") index++;
-      if (name === "exec" && tokens[index] === "-a") index += 2;
-      continue;
-    }
-    if (name === "timeout") {
-      index++;
-      while (index < tokens.length && tokens[index].startsWith("-")) {
-        const option = tokens[index++];
-        if (["-k", "--kill-after", "-s", "--signal"].includes(option) && index < tokens.length) index++;
-      }
-      if (tokens[index] !== undefined) index++;
-      continue;
-    }
-    if (name === "nice") {
-      index++;
-      if (tokens[index] === "-n") index += 2;
-      else if (/^-n\d+$/.test(tokens[index] ?? "")) index++;
-      continue;
-    }
-    return {
-      name,
-      args: tokens.slice(index + 1).map(unquoteToken),
-      rawArgs: tokens.slice(index + 1),
-    };
-  }
-
-  return undefined;
-}
 
 function findExecCommands(args: string[]): string[][] {
   const commands: string[][] = [];
@@ -724,14 +633,6 @@ const PIPE_INTERPRETERS: Record<string, true> = {
 const POSIX_SHELLS: Record<string, true> = {
   sh: true, bash: true, zsh: true, dash: true, csh: true, tcsh: true, ksh: true, fish: true,
 };
-
-interface CommandInvocation {
-  name: string;
-  args: string[];
-  /** Raw token text per arg: `'…'`-quoted operands are literal and must not
-   *  get HOME/tilde expansion (R6). */
-  rawArgs: string[];
-}
 
 interface PathArg {
   value: string;
@@ -1404,29 +1305,6 @@ export function isSensitiveWorkingDirectory(
 //
 // Parses git subcommand + flags to detect behaviors that regex misses
 // (e.g. `git push origin +branch` = force-push via +refspec).
-
-function roughTokenize(command: string): string[] {
-  const tokens: string[] = [];
-  let current = "";
-  let quote: string | null = null;
-  for (let i = 0; i < command.length; i++) {
-    const ch = command[i];
-    if (quote) {
-      current += ch;
-      if (ch === quote) quote = null;
-    } else if (ch === '"' || ch === "'") {
-      quote = ch;
-      current += ch;
-    } else if (/\s/.test(ch)) {
-      if (current) { tokens.push(current); current = ""; }
-    } else {
-      current += ch;
-    }
-  }
-  if (current) tokens.push(current);
-  return tokens;
-}
-
 
 function skipGitGlobalOptions(args: string[]): { subcommand: string; rest: string[] } | null {
   let i = 0;

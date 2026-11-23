@@ -327,3 +327,35 @@ test("domain check resolves .. through symlinks like the filesystem does", () =>
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("command globs tokenize arguments — quoted and escaped space filenames match", () => {
+  const { list } = makeList([
+    { tool: "bash", key: "cat", cwd: CWD, timestamp: "t", pattern: "cat *" },
+  ]);
+  const { list: neg } = makeList([
+    { tool: "bash", key: "x", cwd: CWD, timestamp: "t", pattern: "!cat *" },
+  ]);
+  const { list: wide } = makeList([
+    { tool: "bash", key: "cat", cwd: CWD, timestamp: "t", pattern: "cat **" },
+  ]);
+
+  // `cat *` must match the SAME filename written three legal ways.
+  assert.equal(list.isAllowed("bash", "cat 'a file.txt'", CWD), true, "quoted");
+  assert.equal(list.isAllowed("bash", 'cat "a file.txt"', CWD), true, "double-quoted");
+  assert.equal(list.isAllowed("bash", "cat a\\ file.txt", CWD), true, "escaped");
+
+  // `*` never crosses `/`, so a spaced PATH still needs `**`.
+  assert.equal(list.isAllowed("bash", "cat 'a dir/file'", CWD), false);
+  assert.equal(wide.isAllowed("bash", "cat 'a dir/file'", CWD), true);
+
+  // Two independent arguments are never swallowed by one wildcard.
+  assert.equal(list.isAllowed("bash", "cat a b", CWD), false);
+  assert.equal(wide.isAllowed("bash", "cat a b", CWD), false);
+
+  // Negation sees through quotes too — a protected space filename fails.
+  assert.equal(neg.isAllowed("bash", "cat 'a file.txt'", CWD), false, "negated quoted");
+  assert.equal(neg.isAllowed("bash", "cat a\\ file.txt", CWD), false, "negated escaped");
+  // …and still applies per program inside a compound.
+  assert.equal(neg.isAllowed("bash", "cat a; ls", CWD), false);
+  assert.equal(neg.isAllowed("bash", "ls -la", CWD), true);
+});

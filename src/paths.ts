@@ -84,54 +84,68 @@ function globToRegExp(pattern: string): CompiledPattern {
 
 /**
  * Test a normalized command against a command glob (R5).
- * Positive patterns must match the FULL command: `*`/`?` stay inside one
- * argument and never cross `/`, whitespace, or separators; `**` spans
- * directory separators but still stops at whitespace and command
- * separators — so `chmod * /projects/**` is a three-token pattern.
- * A leading `!` negates per command segment: `!rm *` fails the match when
- * ANY segment of a compound command is `rm …` — a negated rule cannot be
- * slipped past by appending another command.
+ * Patterns are per-argument: the command is tokenized with real shell
+ * rules (quotes and backslash escapes group characters), then each
+ * pattern token is glob-matched against the corresponding argument
+ * VALUE.  `*`/`?` never cross `/`; `**` may — so `cat *` matches
+ * `cat 'a file'` (one argument) but never `cat a b` (two arguments).
+ * A positive pattern authorizes exactly one program — the whole command
+ * must be that program and nothing else.  A leading `!` negates per
+ * program: `!rm *` fails the match when ANY program in the compound is
+ * `rm …` — a negated rule cannot be slipped past by appending another
+ * command or piping through another stage.
  */
 export function matchCommandGlob(pattern: string, value: string): boolean {
   let negate = false;
   let p = pattern.trim();
-  if (p.startsWith("!")) { negate = true; p = p.slice(1); }
+  if (p.startsWith("!")) { negate = true; p = p.slice(1).trim(); }
   if (p === "") return false;
 
-  const re = compileCommandGlob(p);
-  if (re === null) return false;
-  if (!negate) return re.test(value);
-  // Negation applies to each command segment of the compound input: any
-  // segment matching the positive pattern makes the whole entry fail.
-  for (const segment of splitCommandSegments(value)) {
-    if (re.test(segment)) return false;
+  const patternTokens = roughTokenize(p);
+  const argGlobs: (RegExp | null)[] = [];
+  for (const token of patternTokens) {
+    const re = compileArgGlob(unquoteToken(token));
+    if (re === null) return false;
+    argGlobs.push(re);
   }
-  return true;
+
+  const programs = splitCommandSegments(value)
+    .map((segment) => commandAndArgs(segment))
+    .filter((invocation): invocation is CommandInvocation => invocation !== undefined);
+
+  const matches = (invocation: CommandInvocation): boolean => {
+    const program = [invocation.name, ...invocation.args];
+    if (program.length !== argGlobs.length) return false;
+    return argGlobs.every((re, i) => re!.test(program[i]));
+  };
+
+  if (negate) {
+    // Any matching program anywhere in the compound fails the entry.
+    return !programs.some(matches);
+  }
+  // Positive: the command must be exactly one matching program.
+  return programs.length === 1 && matches(programs[0]);
 }
 
-/** Segment boundary characters (unquoted `;` `&` `|` newline parens
- *  and subshell/redirection syntax) for both glob classes and splitting. */
-const GLOB_SEPARATOR = String.raw`\s;&|()<>` + "`";
-
-function compileCommandGlob(pattern: string): RegExp | null {
+/** Compile one pattern ARGUMENT to a regex.  `*`/`?` stay inside the
+ *  argument and never cross `/`; `**` spans `/` too. */
+function compileArgGlob(arg: string): RegExp | null {
   let re = "^";
   let i = 0;
-  while (i < pattern.length) {
-    const c = pattern[i];
+  while (i < arg.length) {
+    const c = arg[i];
     if (c === "*") {
-      if (pattern[i + 1] === "*") {
-        // `**`: within one argument, may cross `/`.
-        re += `[^${GLOB_SEPARATOR}\\n]*`;
+      if (arg[i + 1] === "*") {
+        re += ".*";
         i += 2;
       } else {
-        // `*`: within one argument segment, no `/` crossing.
-        re += `[^/${GLOB_SEPARATOR}\\n]*`;
+        re += "[^/]*";
         i += 1;
       }
     } else if (c === "?") {
-      re += `[^/${GLOB_SEPARATOR}\\n]`;
+      re += "[^/]";
       i += 1;
-    } else if (".+()[]{}^$|".includes(c)) {
+    } else if (".+()[]{}^$|\\".includes(c)) {
       re += "\\" + c;
       i += 1;
     } else {
@@ -200,6 +214,154 @@ export function isUserWritablePath(
     homeCandidates.some((directory) => isWithinDirectory(candidate, directory)) ||
     sessionCandidates.some((directory) => isWithinDirectory(candidate, directory)),
   );
+}
+
+// ── Shell tokenization (shared with behavior analysis and allow-list globs) ─
+
+export interface CommandInvocation {
+  name: string;
+  args: string[];
+  /** Raw token text per arg: `'…'`-quoted operands are literal and must not
+   *  get HOME/tilde expansion (R6). */
+  rawArgs: string[];
+}
+
+export function unquoteToken(token: string): string {
+  if (
+    token.length >= 2 &&
+    ((token[0] === "'" && token[token.length - 1] === "'") ||
+      (token[0] === "\"" && token[token.length - 1] === "\""))
+  ) {
+    const inner = token.slice(1, -1);
+    // Inside double quotes, backslash escapes ", \\, $, ` — unescape those.
+    if (token[0] === "\"") {
+      return inner.replace(/\\(["\\$`])/g, "$1");
+    }
+    return inner;
+  }
+  // Unquoted tokens still carry backslash escapes (\  → space etc.).
+  return token.replace(/\\(.)/g, "$1");
+}
+
+export function isAssignment(token: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*=/.test(unquoteToken(token));
+}
+
+export function roughTokenize(command: string): string[] {
+  const tokens: string[] = [];
+  let current = "";
+  let quote: string | null = null;
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i];
+    if (quote === "\"") {
+      current += ch;
+      if (ch === "\\" && i + 1 < command.length) {
+        current += command[++i]; // \" stays inside the token
+      } else if (ch === "\"") {
+        quote = null;
+      }
+    } else if (quote === "'") {
+      current += ch;
+      if (ch === "'") quote = null;
+    } else if (ch === "\\" && i + 1 < command.length) {
+      // Backslash escapes the next character — it belongs to this token.
+      current += ch + command[++i];
+    } else if (ch === '"' || ch === "'") {
+      quote = ch;
+      current += ch;
+    } else if (/\s/.test(ch)) {
+      if (current) { tokens.push(current); current = ""; }
+    } else {
+      current += ch;
+    }
+  }
+  if (current) tokens.push(current);
+  return tokens;
+}
+
+export function commandAndArgs(
+  segment: string,
+  options: { unwrapXargs?: boolean } = {},
+): CommandInvocation | undefined {
+  const tokens = roughTokenize(segment);
+  let index = 0;
+
+  while (index < tokens.length) {
+    const token = unquoteToken(tokens[index]);
+    const name = path.basename(token).toLowerCase();
+    if (isAssignment(tokens[index]) || ["!", "if", "then", "do", "else", "elif"].includes(name)) {
+      index++;
+      continue;
+    }
+    if (name === "env") {
+      index++;
+      while (index < tokens.length) {
+        const option = unquoteToken(tokens[index]);
+        if (isAssignment(tokens[index])) {
+          index++;
+          continue;
+        }
+        if (option === "--") {
+          index++;
+          break;
+        }
+        if (!option.startsWith("-")) break;
+        index++;
+        if (["-u", "--unset", "-C", "--chdir"].includes(option) && index < tokens.length) index++;
+      }
+      continue;
+    }
+    if (name === "xargs" && options.unwrapXargs !== false) {
+      index++;
+      while (index < tokens.length) {
+        const option = unquoteToken(tokens[index]);
+        if (option === "--") {
+          index++;
+          break;
+        }
+        if (!option.startsWith("-")) break;
+        index++;
+        if (
+          ["-E", "--eof", "-I", "--replace", "-L", "--max-lines", "-n", "--max-args",
+            "-P", "--max-procs", "-s", "--max-chars", "-d", "--delimiter", "-a", "--arg-file"].includes(option) &&
+          index < tokens.length
+        ) {
+          index++;
+        }
+      }
+      continue;
+    }
+    if (["command", "exec", "nohup", "time", "setsid"].includes(name)) {
+      index++;
+      if (["command", "time"].includes(name) && tokens[index] === "-p") index++;
+      if (name === "setsid" && tokens[index] === "-f") index++;
+      if (tokens[index] === "--") index++;
+      if (name === "exec" && tokens[index] === "-a") index += 2;
+      continue;
+    }
+    if (name === "timeout") {
+      index++;
+      while (index < tokens.length && tokens[index].startsWith("-")) {
+        const option = tokens[index++];
+        if (["-k", "--kill-after", "-s", "--signal"].includes(option) && index < tokens.length) index++;
+      }
+      if (tokens[index] !== undefined) index++;
+      continue;
+    }
+    if (name === "nice") {
+      index++;
+      if (tokens[index] === "-n") index += 2;
+      else if (/^-n\d+$/.test(tokens[index] ?? "")) index++;
+      continue;
+    }
+    return {
+      name,
+      args: tokens.slice(index + 1).map(unquoteToken),
+      rawArgs: tokens.slice(index + 1),
+    };
+  }
+
+  return undefined;
 }
 
 /** Resolve a local path and its symlinked ancestors, including missing write targets.
