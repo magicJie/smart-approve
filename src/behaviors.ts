@@ -852,9 +852,10 @@ interface HeredocWork {
  *  unterminated heredoc sets `unterminated` (Q2).  A trailing empty
  *  fragment from `split("\n")` is NOT a real blank line (N1). */
 function splitHeredocWork(command: string): HeredocWork {
-  // T1: collapse continuations with the same state machine normalize uses,
-  // so the pre-scan and the consumer see identical segment content.
-  const lines = collapseLineContinuations(command).split("\n");
+  // U1: scan heredocs on PHYSICAL lines first; continuation folding happens
+  // per completed command item, never across a heredoc body.  Body lines
+  // stay verbatim and never touch the command lexical state.
+  const lines = command.split("\n");
   if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
   const items: HeredocWorkItem[] = [];
   const delimiters: {
@@ -899,6 +900,7 @@ function splitHeredocWork(command: string): HeredocWork {
       currentItem.text += `\n${line}`; // continuation / open quote (S2)
     }
     const itemIndex = items.length - 1;
+    let continued = false; // line ends in a REAL continuation (T2)
 
     for (let i = 0; i < line.length; i++) {
       const c = line[i];
@@ -909,11 +911,22 @@ function splitHeredocWork(command: string): HeredocWork {
       }
       if (quote === "\"") {
         segmentHasContent = true;
-        if (c === "\\") { i++; continue; }
+        if (c === "\\") {
+          if (i + 1 >= line.length) continued = true;
+          i++;
+          continue;
+        }
         if (c === "\"") quote = undefined;
         continue;
       }
-      if (c === "\\") { segmentHasContent = true; i++; continue; }
+      if (c === "\\") {
+        // A trailing continuation backslash collapses to NOTHING — it must
+        // not count as segment content (T1/U2); any other escape is content.
+        if (i + 1 < line.length) segmentHasContent = true;
+        else continued = true;
+        i++;
+        continue;
+      }
       if (c === "'" || c === "\"") { quote = c; segmentHasContent = true; continue; }
       if (c === "#" && (i === 0 || /[\s;|&(]/.test(line[i - 1]))) break; // comment
       // Mirror commandGroups' EMISSION semantics for the group index (S1):
@@ -974,17 +987,18 @@ function splitHeredocWork(command: string): HeredocWork {
       i = j - 1;
     }
 
-    // A logical command continues while a quote is open or the line ends in
-    // an unescaped backslash (outside single quotes).
-    if (quote === undefined) {
-      let trailing = 0;
-      for (let k = line.length - 1; k >= 0 && line[k] === "\\"; k--) trailing++;
-      if (trailing % 2 === 0) currentItem = undefined;
-    }
+    // A logical command continues while a quote is open or the scanner saw
+    // a real trailing continuation — a comment's trailing backslash and a
+    // literal `\\` pair do NOT continue (T2).
+    if (quote === undefined && !continued) currentItem = undefined;
   }
   const unterminated = delimiters.length > 0;
   for (const d of delimiters) finishBody(d.id, d.item, d.group, d.quoted);
   for (const exp of expansions) items[exp.item]?.expansions.push({ group: exp.group, bodies: exp.bodies });
+
+  // Collapse continuations per COMMAND item only — heredoc bodies were
+  // consumed verbatim and never took part in this lexical state (U1).
+  for (const item of items) item.text = collapseLineContinuations(item.text);
 
   // S2: no heredoc anywhere → preserve the original whole-text pipeline.
   if (!hadHeredoc) return { items: [{ text: command, expansions: [] }], unterminated: false };

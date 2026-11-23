@@ -1422,3 +1422,41 @@ test("comment backslash, escaped backslash, and quoted apostrophe follow bash (T
     analyzeCommand("printf a | sh").behaviors,
   );
 });
+
+test("quoted heredoc bodies never leak lexical state into later commands (U1)", () => {
+  // ① An apostrophe in a QUOTED body is data; a single-quoted filename
+  // with a literal backslash-newline after the body keeps its identity.
+  const a = commandFileTargets(
+    "cat <<'EOF'\nit's data\nEOF\ncat 'a\\\nb'\n",
+    "/tmp",
+  );
+  assert.deepEqual(a.targets.map((t) => t.value), ["a\\\nb"],
+    `quoted body's apostrophe must not flip command quote state: ${JSON.stringify(a.targets)}`);
+  assert.equal(a.undeterminable, false);
+
+  // ② A quoted body line ending in a literal backslash must NOT merge
+  // with the closing delimiter — the heredoc still terminates.
+  const b = commandFileTargets(
+    "cat <<'EOF'\nends with \\\nEOF\ncat note\n",
+    "/tmp",
+  );
+  assert.deepEqual(b.targets.map((t) => t.value), ["note"]);
+  assert.equal(b.undeterminable, false, "body backslash must not eat the delimiter");
+
+  // ③ A quoted body containing `12"` must not open a double-quote state;
+  // a comment ending in `\` still lets the next line run.
+  const c = commandFileTargets(
+    'cat <<\'EOF\'\n12"\nEOF\n# comment \\\ncat note\n',
+    "/tmp",
+  );
+  assert.ok(c.targets.map((t) => t.value).includes("note"),
+    `note after body+comment must be analyzed: ${JSON.stringify(c.targets)}`);
+});
+
+test("continuation before the opening paren also binds the segment (U2)", () => {
+  const single = commandFileTargets("( cat <<EOF\n$(cat note)\nEOF\n )\n", "/tmp");
+  const before = commandFileTargets("\\\n( cat <<EOF\n$(cat note)\nEOF\n )\n", "/tmp");
+  assert.deepEqual(before.targets, single.targets);
+  assert.equal(before.undeterminable, single.undeterminable);
+  assert.ok(before.targets.some((t) => t.value === "note"));
+});
