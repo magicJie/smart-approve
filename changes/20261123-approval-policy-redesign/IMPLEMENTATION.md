@@ -131,7 +131,7 @@ $ bun run build       # dist/index.js 199.91 KB
 | 组 | 修正 | 断言 |
 |----|------|------|
 | R1 管线相邻 | `pipeStageProgram`：每级取实际执行程序 basename；env/sudo/doas 解包到内层命令头；fetch→interpreter 改为**逐对相邻**扫描（`curl … \| cat \| sh` 不再误判）；xargs 保持其自身身份 | `remote-fetch-exec requires truly adjacent pairs`：wrapped 源（sudo/env/doas）仍硬拒、`cat` 隔开不误伤、尾接 `tee` 同裁决 |
-| R2 目标提取 | `stageFileOptionTargets` + 选项表：`tar/curl/wget/find/sort/git/ssh` 等文件型选项值计入目标（`-o`/`-O`/`-K`/`-F`/`--reference` 等）；非文件选项值跳过；重定向目标逐段计入（`/dev/null` 豁免）；`scp/rsync` 远程操作数正则排除；未知命令有操作数即 `undeterminable` → 普通审批；非 bash 工具需 `looksLikeSinglePath` 才按路径处理（eval 源码不再当路径） | `domain matching handles mixed targets, spaces, links, and cwd`（域内混合目标/含空格/域外链接）；重定向目标断言在 R2/R3 追加（见 §八 复审修正 R3 片 A：`literal tilde and HOME quoting…` 重定向用例、`domain entries see sort/git file targets…`） |
+| R2 目标提取 | `stageFileOptionTargets` + 选项表：`tar/curl/wget/find/sort/git/ssh` 等文件型选项值计入目标（`-o`/`-O`/`-K`/`-F`/`--reference` 等）；非文件选项值跳过；重定向目标逐段计入（`/dev/null` 豁免）；`scp/rsync` 远程操作数正则排除；未知命令有操作数即 `undeterminable` → 普通审批；非 bash 工具需 `looksLikeSinglePath` 才按路径处理（eval 源码不再当路径） | `domain matching handles mixed targets, spaces, links, and cwd`（域内混合目标/含空格/域外链接）；重定向目标断言在 R2/R3 追加（见 §九 复审修正 R3 片 A：`literal tilde and HOME quoting…` 重定向用例、`domain entries see sort/git file targets…`） |
 | R3 路径解析 | `semanticPathCandidates` 按 realpath 逐组件顺序解析，`l/../etc/passwd`（l→/etc）判 /etc 而非词法折叠；缺失尾部保留已解析前缀；`cd` 应用一次：bash gate 新增 `analysisCwd` 钩子传“命令自身 cd 生效前”的 cwd，域提取/`commandFileTargets` 用同一 cwd | gate.test.ts `a leading cd in the bash command is applied once`：`cd l && chmod 777 f`（l→/etc）硬拒、`cd sub && chmod 777 f` 可判放行；`semantic path resolution keeps .. components` |
 | R4 包装/argv | POSIX `-c` 接受组合选项簇（`bash -xc`、`sh -euc`）；ssh 远端 argv 按命令行 `join(" ")`（远端本就走 shell，不重引整体）；eval 侧 argv 数组逐元素 `quoteShellArgument` 拼接——`["printf","meeting; reboot"]` 是一个参数；`launchCommands` 以 `currentCwd`（含 `%cd`/`!cd` 转换）分析 JS spawn、`shellCwd`（段内 cd 链）分析 `!cmd`/`os.system`；`innerDenyTier` 并入 `denyTier` | `argv arrays keep argument boundaries`、`python !-shell tracks cd across segments and merges deny tiers`（`!git push -f` denyTier=true） |
 | R5 glob 边界 | `matchCommandGlob` 重写：按命令段拆分；`**` 覆盖整个参数（含 `/`）但不跨空白/分隔符、`*`/`?` 不跨 `/`、空白、分隔符；`!pat` 否定按段生效——复合命令中任一段命中即拒 | `command globs reject extra command segments and honor negation`：`chmod **` 不吞多参数、`rm *; ls` 中 `!rm *` 命中 rm 段即拒 |
@@ -172,6 +172,32 @@ $ bun test src
  0 fail
 Ran 242 tests across 14 files.
 $ bun run build       # dist/index.js 211.76 KB
+```
+
+**偏差**：无。
+
+## 十、复审修正 R4（对应 REVIEW.md「第四轮 · 29006fe」W1–W4）
+
+复审对象：`29006fe`。四项必修逐项交付；R4（eval cwd 交错）第四轮已关闭，不再重复。
+
+| 项 | 修正 | 断言 |
+|----|------|------|
+| W1（glob 程序名丢路径） | `CommandInvocation` 新增 `program` 字段，保留被调用 token 的完整路径与大小写（`/usr/bin/sort`、`CURL`）；`name` 仍是分类用的小写 basename；`matchCommandGlob` 改为对 `program` 匹配而非分类视图 | `command globs distinguish full paths from same-name programs`（allowlist.test.ts）：`/usr/bin/sort` 正向规则只匹配该路径（裸 `sort`、`/opt/bin/sort` 均不匹配）；否定规则 `!/usr/bin/sort ** ** **` 拒该路径而裸 `sort`/`ls` 不受影响 |
+| W2（sort 连写选项漏目标） | `stageFileOptionTargets` 识别 GNU 短选项连写值（`-oout` ≡ `-o out`，文件型/非文件型表均处理）；`redirectionTargets` 返回 `{targets, incomplete}`：`<` 输入重定向同样计入文件目标、无法识别的重定向置 `incomplete` → 域检查 `undeterminable` → 普通审批（heredoc/here-string/fd 复制无文件目标，不置位）；`commandGroups`/`splitCommandSegments` 不再把 `>&`/`<&` 的 `&` 当分隔符；`commandFileTargets` 结果按 cwd+value 去重；`stagePathArgs` 排除重定向操作符 token | `attached option values and input redirection are file targets`（behaviors.test.ts）：`-o out` 与 `-oout` 目标集相同、`sort < in.tsv` 计入输入、`cat <<EOF`/`cat <&3` 非文件目标、`cat < ` 为 undeterminable；`domain entries cover input redirection and attached output spellings`（allowlist.test.ts）：`-oout.tsv` 域内放行、`< /etc/passwd` 与 `-o/etc/x` 域外拒绝 |
+| W3（文件工具提前折叠） | `semanticPathCandidates` 在分量遍历前先展开 `~`/`$HOME`（与 lexical 一致，不再产生 `cwd/~/…` 伪候选）；域根按配置语义经 `expandHomeLiteral` 展开一次后走共享解析；write/edit 域分支把原始路径+cwd 直接交共享 realpath 解析器（删除前置 `path.resolve`）；`ProtectedPathMatcher.isProtected`（index.ts:394 调用链）与 `isHardBlockedFileTarget` 同样改用 realpath 顺序解析；`expandHomeLiteral` 移至 paths.ts 共用 | `write/edit domain targets resolve .. through symlinks (no early path.resolve)`：`l/../note`（l→/etc）按 realpath 落 `/note` 域外拒绝、普通域内文件不受影响、`~` 域根正确展开且域外绝对路径拒绝 |
+| W4（转义字面量回归） | `pathArg.literal` 增加前导 `\~`/`\$`（未加引号）与 `"\$`（双引号内）判定——转义与单引号同语义；仅前导位置为字面量，`~/\~x` 的 home 前缀仍展开；真 home 根保持硬阻断 | `escaped tilde and dollar literals match their quoted forms (W4)`：`chmod 777 \~` 与 `chmod 777 '~'` 行为一致（user tier、不阻断）、`chmod 777 ~` 仍硬阻断、`>\$HOME/out` 与 `"\$HOME/out"`、`>'$HOME/out'` 三者目标值一致、`>~/out` 仍展开 |
+
+另：§八 R2 行内"见 §八 复审修正 R3 片 A"章节号已更正为 §九。
+
+**复审修正 R4 后验证**：
+
+```
+$ bun run typecheck   # tsc --noEmit → clean
+$ bun test src
+ 247 pass
+ 0 fail
+Ran 247 tests across 14 files.
+$ bun run build       # dist/index.js 213.61 KB
 ```
 
 **偏差**：无。
