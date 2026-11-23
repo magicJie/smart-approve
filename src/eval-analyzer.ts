@@ -14,7 +14,7 @@
  */
 
 import type { DangerAnalysis } from "./types.ts";
-import { analyzeBashOperation, isSensitiveWorkingDirectory, labelForBehavior } from "./behaviors.ts";
+import { analyzeBashOperation, isSensitiveWorkingDirectory, labelForBehavior, quoteShellArgument } from "./behaviors.ts";
 import { makeLabel } from "./i18n.ts";
 import { resolveFilesystemPathCandidates } from "./paths.ts";
 import * as fs from "node:fs";
@@ -1453,7 +1453,11 @@ function extractSpawnCommandText(code: string, childProcessImport: boolean): str
   const commands = new Set<string>();
   const addArgs = (body: string): void => {
     const args = quotedArrayArgs(body);
-    if (args.length > 0) commands.add(args.join(" "));
+    // argv arrays keep their argument boundaries — each element is quoted
+    // back into shell text so `["printf","a; b"]` stays one argument (R4).
+    if (args.length > 0) {
+      commands.add(args.map(quoteShellArgument).join(" "));
+    }
   };
 
   for (const match of code.matchAll(/Bun\.\$\s*`([^`]*)`/g)) commands.add(match[1]);
@@ -1475,37 +1479,37 @@ function extractSpawnCommandText(code: string, childProcessImport: boolean): str
   for (const match of code.matchAll(
     /(?:execFile(?:Sync)?|spawn(?:Sync)?)\s*\(\s*(["'])([\s\S]*?)\1\s*(?:,\s*\[([^\]]*)\])?/g,
   )) {
-    commands.add([match[2], ...quotedArrayArgs(match[3] ?? "")].join(" "));
+    commands.add([match[2], ...quotedArrayArgs(match[3] ?? "")].map(quoteShellArgument).join(" "));
   }
 
   for (const match of code.matchAll(
     /(?:^|[^\w$])os\.exec(?:vpe|vp|ve|v)\s*\(\s*(["'])([\s\S]*?)\1\s*(?:,\s*\[([^\]]*)\])?/g,
   )) {
-    commands.add([match[2], ...quotedArrayArgs(match[3] ?? "")].join(" "));
+    commands.add([match[2], ...quotedArrayArgs(match[3] ?? "")].map(quoteShellArgument).join(" "));
   }
 
   for (const match of code.matchAll(
     /(?:^|[^\w$])os\.exec(?:lpe|lp|le|l)\s*\(\s*(["'])([\s\S]*?)\1([^)]*)/g,
   )) {
-    commands.add([match[2], ...quotedArrayArgs(match[3] ?? "")].join(" "));
+    commands.add([match[2], ...quotedArrayArgs(match[3] ?? "")].map(quoteShellArgument).join(" "));
   }
 
   for (const match of code.matchAll(
     /(?:^|[^\w$])os\.spawn(?:vpe|vp|ve|v)\s*\(\s*[^,]+,\s*(["'])([\s\S]*?)\1\s*(?:,\s*\[([^\]]*)\])?/g,
   )) {
-    commands.add([match[2], ...quotedArrayArgs(match[3] ?? "")].join(" "));
+    commands.add([match[2], ...quotedArrayArgs(match[3] ?? "")].map(quoteShellArgument).join(" "));
   }
 
   for (const match of code.matchAll(
     /(?:^|[^\w$])os\.spawn(?:lpe|lp|le|l)\s*\(\s*[^,]+,\s*(["'])([\s\S]*?)\1([^)]*)/g,
   )) {
-    commands.add([match[2], ...quotedArrayArgs(match[3] ?? "")].join(" "));
+    commands.add([match[2], ...quotedArrayArgs(match[3] ?? "")].map(quoteShellArgument).join(" "));
   }
 
   for (const match of code.matchAll(
     /(?:^|[^\w$])(?:os\.)?posix_spawnp?\s*\(\s*(["'])([\s\S]*?)\1\s*(?:,\s*\[([^\]]*)\])?/g,
   )) {
-    commands.add([match[2], ...quotedArrayArgs(match[3] ?? "")].join(" "));
+    commands.add([match[2], ...quotedArrayArgs(match[3] ?? "")].map(quoteShellArgument).join(" "));
   }
 
   return [...commands];
@@ -1595,41 +1599,11 @@ export class EvalCodeBehaviorAnalyzer {
     // legacy dangerous arguments are still matched across the joined stream,
     // so `["rm", "-rf", …]` and `/etc/passwd` references keep blocking.
     const launchView = shellText.replace(/["'`]+/g, " ").replace(/\s*,\s*/g, " ");
-    const launchCommands = [
-      ...extractSpawnCommandText(codeText, childProcessImport),
-      ...(pythonScan?.commands ?? []),
-    ];
-    // B2: statically recognizable spawn commands go through the full bash
-    // analysis so their own behaviors, hard blocks, and headless shutdown
-    // confirmations survive the eval hop (privileged-exec keeps its label
-    // for the LLM caution note).
-    let innerHardBlocked = false;
-    let innerRequiresConfirmation = false;
-    let innerDenyTier = false;
-    let shellPivot = false;
-    if (hasProcessSpawn) {
-      for (const command of launchCommands) {
-        const inner = analyzeBashOperation(command, base, session, { hasUI });
-        for (const behavior of inner.behaviors) {
-          if (behavior === "sensitive-working-directory") continue;
-          found.add(behavior);
-        }
-        if (inner.hardBlocked) innerHardBlocked = true;
-        if (inner.requiresConfirmation) innerRequiresConfirmation = true;
-        if (inner.denyTier) innerDenyTier = true;
-        if (inner.behaviors.includes("high-risk-shell-pivot")) shellPivot = true;
-      }
-    }
-    const riskyLaunch = hasProcessSpawn && !dangerousPayload && shellPivot;
-    const riskyArguments =
-      hasProcessSpawn &&
-      !dangerousPayload &&
-      DANGEROUS_ARGUMENT_PATTERNS.some((pattern) => pattern.test(launchView));
-    if (riskyLaunch || riskyArguments) found.add("eval-risky-process");
 
     // Literal cwd operations are resolved in source order against the
     // effective base; the shared helper applies the outside-session-root
-    // exception and compares lexical + canonical candidates.
+    // exception and compares lexical + canonical candidates.  JS/argv spawns
+    // are analyzed with the cwd in effect at their position (R4).
     let currentCwd = base;
     let sensitiveCwd = false;
     for (const target of extractEvalWriteTargets(source, language).cwdPaths) {
@@ -1641,13 +1615,42 @@ export class EvalCodeBehaviorAnalyzer {
       if (candidates.length > 0) currentCwd = candidates[candidates.length - 1];
     }
 
+    // B2: statically recognizable spawn commands go through the full bash
+    // analysis so their own behaviors, hard blocks, headless shutdown
+    // confirmations AND deny-tier verdicts survive the eval hop (privileged-
+    // exec keeps its label for the LLM caution note).  R4: JS spawns use the
+    // effective cwd at their position; `!cmd` shell segments use the cwd
+    // tracked across that magic's own `cd` segments.
+    let innerHardBlocked = false;
+    let innerRequiresConfirmation = false;
+    let innerDenyTier = false;
+    let shellPivot = false;
+    const mergeInner = (inner: DangerAnalysis): void => {
+      for (const behavior of inner.behaviors) {
+        if (behavior === "sensitive-working-directory") continue;
+        found.add(behavior);
+      }
+      if (inner.hardBlocked) innerHardBlocked = true;
+      if (inner.requiresConfirmation) innerRequiresConfirmation = true;
+      if (inner.denyTier) innerDenyTier = true;
+      if (inner.behaviors.includes("high-risk-shell-pivot")) shellPivot = true;
+    };
+    const codeSpawns = extractSpawnCommandText(codeText, childProcessImport);
+    for (const command of codeSpawns) {
+      mergeInner(analyzeBashOperation(command, currentCwd, session, { hasUI }));
+    }
+
     // A leading `cd` inside each `!cmd` or `%%bash` segment runs the
     // following shell operations in that directory even though the runtime
-    // cwd is unchanged.  Track literal segments in order.
+    // cwd is unchanged.  Track literal segments in order; each magic is
+    // analyzed with the cwd in effect when it starts (R4).
     let shellCwd: string | undefined = base;
     let shellSensitiveCwd = false;
     let shellUnresolvedCwd = false;
     for (const command of pythonScan?.commands ?? []) {
+      if (shellCwd !== undefined) {
+        mergeInner(analyzeBashOperation(command, shellCwd, session, { hasUI }));
+      }
       for (const segment of splitShellSegments(command)) {
         const leading = parseLeadingShellCwd(segment);
         if (leading.unresolved) {
@@ -1679,6 +1682,13 @@ export class EvalCodeBehaviorAnalyzer {
     }
     if (sensitiveCwd || shellSensitiveCwd) found.add("eval-sensitive-working-directory");
     if (shellUnresolvedCwd) found.add("eval-unresolved-shell-cwd");
+
+    const riskyLaunch = hasProcessSpawn && !dangerousPayload && shellPivot;
+    const riskyArguments =
+      hasProcessSpawn &&
+      !dangerousPayload &&
+      DANGEROUS_ARGUMENT_PATTERNS.some((pattern) => pattern.test(launchView));
+    if (riskyLaunch || riskyArguments) found.add("eval-risky-process");
 
     const requiresConfirmation =
       shellUnresolvedCwd ||

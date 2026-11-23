@@ -1278,3 +1278,32 @@ test("gate: one migrated config drives UI dialog, headless model, headless confi
   assert.equal(forced.calls.analyze, 0);
   assert.equal(forced.calls.delegate, 0);
 });
+
+// ── REVIEW R3: leading cd applies once (gate level) ──────────────────
+
+test("a leading cd in the bash command is applied once, not twice", async () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "smart-approve-cd-"));
+  try {
+    fs.symlinkSync("/etc", path.join(root, "l"));
+    const h = makeHarness();
+    h.ctx.cwd = root;
+    // Correct: cd l → /etc, chmod f → /etc/f → system → hard block.
+    // Double-applied cd (cd l applied before AND inside analysis) would
+    // resolve f under /etc/../ = still system? — no: pre-fix code fed the
+    // post-cd cwd and the analyzer re-walked `cd l` again from /etc,
+    // landing f in a different directory and misclassifying the tier.
+    const r = await run(BashToolGate, h, { command: "cd l && chmod 777 f" });
+    assert.equal(r.isError, true, "system target must block");
+    assert.equal(h.calls.delegate, 0);
+
+    // Positive side: cd into a user dir stays reviewable → delegates.
+    fs.mkdirSync(path.join(root, "sub"));
+    const h2 = makeHarness({}, { analyzeResult: { risk: "low", recommend: "allow" } });
+    h2.ctx.cwd = root;
+    h2.selectResult = "Allow for this session";
+    const r2 = await run(BashToolGate, h2, { command: "cd sub && chmod 777 f" });
+    assert.equal(r2.isError ?? false, false, "user-tier target must pass");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

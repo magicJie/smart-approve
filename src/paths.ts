@@ -83,10 +83,14 @@ function globToRegExp(pattern: string): CompiledPattern {
 }
 
 /**
- * Test a normalized command against a command glob.
- * Anchored at both ends. `*`/`?` span arguments but never cross command
- * separators (`;`, `&`, `|`, newline, subshell/redirect syntax); `**`
- * spans everything.  A leading `!` negates the match.
+ * Test a normalized command against a command glob (R5).
+ * Positive patterns must match the FULL command: `*`/`?` stay inside one
+ * argument and never cross `/`, whitespace, or separators; `**` spans
+ * directory separators but still stops at whitespace and command
+ * separators — so `chmod * /projects/**` is a three-token pattern.
+ * A leading `!` negates per command segment: `!rm *` fails the match when
+ * ANY segment of a compound command is `rm …` — a negated rule cannot be
+ * slipped past by appending another command.
  */
 export function matchCommandGlob(pattern: string, value: string): boolean {
   let negate = false;
@@ -94,21 +98,38 @@ export function matchCommandGlob(pattern: string, value: string): boolean {
   if (p.startsWith("!")) { negate = true; p = p.slice(1); }
   if (p === "") return false;
 
+  const re = compileCommandGlob(p);
+  if (re === null) return false;
+  if (!negate) return re.test(value);
+  // Negation applies to each command segment of the compound input: any
+  // segment matching the positive pattern makes the whole entry fail.
+  for (const segment of splitCommandSegments(value)) {
+    if (re.test(segment)) return false;
+  }
+  return true;
+}
+
+/** Segment boundary characters (unquoted `;` `&` `|` newline parens
+ *  and subshell/redirection syntax) for both glob classes and splitting. */
+const GLOB_SEPARATOR = String.raw`\s;&|()<>` + "`";
+
+function compileCommandGlob(pattern: string): RegExp | null {
   let re = "^";
   let i = 0;
-  while (i < p.length) {
-    const c = p[i];
+  while (i < pattern.length) {
+    const c = pattern[i];
     if (c === "*") {
-      if (p[i + 1] === "*") {
-        re += ".*";
+      if (pattern[i + 1] === "*") {
+        // `**`: within one argument, may cross `/`.
+        re += `[^${GLOB_SEPARATOR}\\n]*`;
         i += 2;
       } else {
-        // Arguments yes, command separators never.
-        re += "[^;&|()<>`\\n]*";
+        // `*`: within one argument segment, no `/` crossing.
+        re += `[^/${GLOB_SEPARATOR}\\n]*`;
         i += 1;
       }
     } else if (c === "?") {
-      re += "[^;&|()<>`\\n]";
+      re += `[^/${GLOB_SEPARATOR}\\n]`;
       i += 1;
     } else if (".+()[]{}^$|".includes(c)) {
       re += "\\" + c;
@@ -118,7 +139,44 @@ export function matchCommandGlob(pattern: string, value: string): boolean {
       i += 1;
     }
   }
-  return new RegExp(re + "$").test(value) !== negate;
+  try {
+    return new RegExp(re + "$");
+  } catch {
+    return null;
+  }
+}
+
+/** Quote- and escape-aware segment split for negation scoping. */
+function splitCommandSegments(value: string): string[] {
+  const result: string[] = [];
+  let start = 0;
+  let quote: string | undefined;
+  let escaped = false;
+  for (let i = 0; i < value.length; i++) {
+    const ch = value[i];
+    if (escaped) { escaped = false; continue; }
+    if (ch === "\\") { escaped = true; continue; }
+    if (quote !== undefined) {
+      if (ch === quote) quote = undefined;
+      continue;
+    }
+    if (ch === "'" || ch === "\"" || ch === "`") { quote = ch; continue; }
+    if (ch === ";" || ch === "\n" || ch === "(" || ch === ")") {
+      const segment = value.slice(start, i).trim();
+      if (segment) result.push(segment);
+      start = i + 1;
+      continue;
+    }
+    if (ch === "&" || (ch === "|")) {
+      const segment = value.slice(start, i).trim();
+      if (segment) result.push(segment);
+      if (value[i + 1] === ch) i++;
+      start = i + 1;
+    }
+  }
+  const tail = value.slice(start).trim();
+  if (tail) result.push(tail);
+  return result;
 }
 
 /**

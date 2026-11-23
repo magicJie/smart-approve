@@ -120,7 +120,7 @@ test("combined pattern+domain entries reject single-side matches", () => {
       key: "chmod 600 file",
       cwd: CWD,
       timestamp: "2026-01-01",
-      pattern: "chmod *",
+      pattern: "chmod ** /home/jay/projects/**",
       domain,
     },
   ]);
@@ -146,7 +146,7 @@ test("exact keys outside their scope are rejected", () => {
       key: "rm -rf /tmp/x",
       cwd: CWD,
       timestamp: "2026-01-01",
-      pattern: "chmod *",
+      pattern: "chmod **",
     },
   ]);
   try {
@@ -164,7 +164,7 @@ test("command globs reject extra command segments and honor negation", () => {
       key: "chmod 600 file",
       cwd: CWD,
       timestamp: "2026-01-01",
-      pattern: "chmod *",
+      pattern: "chmod ** **",
     },
   ]);
   const { list: negated, dir: negatedDir } = makeList([
@@ -177,12 +177,31 @@ test("command globs reject extra command segments and honor negation", () => {
     },
   ]);
   try {
-    // Single-star globs may not cross argument boundaries or separators.
+    // `**` spans a whole argument (incl. `/`) but never whitespace or
+    // separators — compound commands can never satisfy it.
     assert.equal(list.isAllowed("bash", "chmod 600 file; rm -rf /tmp/x", CWD), false);
     assert.equal(list.isAllowed("bash", "chmod 600 file && ls", CWD), false);
     assert.equal(list.isAllowed("bash", "chmod 600 file", CWD), true);
-    // Negated pattern: rm rejected, other commands matched.
+    // `*` stays inside one argument and never crosses `/` or whitespace.
+    const { list: singleStar, dir: singleDir } = makeList([
+      {
+        tool: "bash",
+        key: "k",
+        cwd: CWD,
+        timestamp: "2026-01-01",
+        pattern: "chmod *",
+      },
+    ]);
+    try {
+      assert.equal(singleStar.isAllowed("bash", "chmod 600", CWD), true);
+      assert.equal(singleStar.isAllowed("bash", "chmod 600 file", CWD), false);
+      assert.equal(singleStar.isAllowed("bash", "chmod a/x", CWD), false);
+    } finally {
+      cleanup(singleDir);
+    }
+    // Negated pattern: any `rm …` segment — even in a compound — fails.
     assert.equal(negated.isAllowed("bash", "rm file", CWD), false);
+    assert.equal(negated.isAllowed("bash", "rm file; ls", CWD), false);
     assert.equal(negated.isAllowed("bash", "ls -la", CWD), true);
   } finally {
     cleanup(dir);

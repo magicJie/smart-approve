@@ -123,3 +123,31 @@ $ bun test src
 Ran 229 tests across 14 files.
 $ bun run build       # dist/index.js 199.91 KB
 ```
+
+## 八、复审修正 R2（对应 REVIEW.md 返工六组项）
+
+复审对象：`4a72d44` 之后轮次。六组结构性修正，均带正反断言。
+
+| 组 | 修正 | 断言 |
+|----|------|------|
+| R1 管线相邻 | `pipeStageProgram`：每级取实际执行程序 basename；env/sudo/doas 解包到内层命令头；fetch→interpreter 改为**逐对相邻**扫描（`curl … \| cat \| sh` 不再误判）；xargs 保持其自身身份 | `remote-fetch-exec requires truly adjacent pairs`：wrapped 源（sudo/env/doas）仍硬拒、`cat` 隔开不误伤、尾接 `tee` 同裁决 |
+| R2 目标提取 | `stageFileOptionTargets` + 选项表：`tar/curl/wget/find/sort/git/ssh` 等文件型选项值计入目标（`-o`/`-O`/`-K`/`-F`/`--reference` 等）；非文件选项值跳过；重定向目标逐段计入（`/dev/null` 豁免）；`scp/rsync` 远程操作数正则排除；未知命令有操作数即 `undeterminable` → 普通审批；非 bash 工具需 `looksLikeSinglePath` 才按路径处理（eval 源码不再当路径） | `domain matching handles…` 扩展：含引号、重定向、选项值目标；`curl file.txt` 无输出选项 → 无目标（URL 语义） |
+| R3 路径解析 | `semanticPathCandidates` 按 realpath 逐组件顺序解析，`l/../etc/passwd`（l→/etc）判 /etc 而非词法折叠；缺失尾部保留已解析前缀；`cd` 应用一次：bash gate 新增 `analysisCwd` 钩子传“命令自身 cd 生效前”的 cwd，域提取/`commandFileTargets` 用同一 cwd | gate.test.ts `a leading cd in the bash command is applied once`：`cd l && chmod 777 f`（l→/etc）硬拒、`cd sub && chmod 777 f` 可判放行；`semantic path resolution keeps .. components` |
+| R4 包装/argv | POSIX `-c` 接受组合选项簇（`bash -xc`、`sh -euc`）；ssh 远端 argv 逐元素 `quoteShellArgument` 再 `join(" ")`（远端本就走 shell）；eval 侧 argv 数组同样带引号拼接——`["printf","meeting; reboot"]` 是一个参数；`launchCommands` 以 `currentCwd`（含 `%cd`/`!cd` 转换）分析 JS spawn、`shellCwd`（段内 cd 链）分析 `!cmd`/`os.system`；`innerDenyTier` 并入 `denyTier` | `argv arrays keep argument boundaries`、`python !-shell tracks cd across segments and merges deny tiers`（`!git push -f` denyTier=true） |
+| R5 glob 边界 | `matchCommandGlob` 重写：按命令段拆分；`**` 覆盖整个参数（含 `/`）但不跨空白/分隔符、`*`/`?` 不跨 `/`、空白、分隔符；`!pat` 否定按段生效——复合命令中任一段命中即拒 | `command globs reject extra command segments and honor negation`：`chmod **` 不吞多参数、`rm *; ls` 中 `!rm *` 命中 rm 段即拒 |
+| R6 权限操作数 | `PERMISSION_SHORT_OPTIONS_RE` 白名单化（`-w` 等符号模式按操作数处理，不再静默丢弃目标）；`--reference`（GNU/bsd 双形）取参照文件属主：可 stat 且属主/组不同 → 硬拒，不可 stat → 可判未知；`'$HOME'`/`"~"` 单引号/字面不展开（`pathArg.literal` 贯通 cd/dd/权限目标） | `permission operands honor roles, --reference, and literal quoting`：`chmod -w /etc/passwd` 硬拒、`chmod 777 '$HOME'` 可判、`--reference /etc/hostname` 硬拒、缺失参照可判 |
+
+**附带修复的自身缺陷**：`permissionChangeTier` 中 `--reference` 判定算出后未使用（漏 `if (refOther) return`）；`semanticPathCandidates` 尾部缺失时丢弃已解析前缀；`pathArg` 未区分双引号内 `~`（双引号下 `~` 本就不展开）。
+
+**R2 复审修正后验证**：
+
+```
+$ bun run typecheck   # tsc --noEmit → clean
+$ bun test src
+ 236 pass
+ 0 fail
+Ran 236 tests across 14 files.
+$ bun run build       # dist/index.js 208.87 KB
+```
+
+**偏差**：无。

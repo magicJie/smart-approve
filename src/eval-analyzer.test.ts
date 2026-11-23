@@ -1270,3 +1270,42 @@ test("labels map 1:1 to behaviors with natural bilingual text", () => {
   assert.equal(r.labels[3].zh, "删除家目录 ~");
   assert.equal(r.hardBlocked, true);
 });
+
+// ── REVIEW R4: argv boundaries, effective cwd, merged verdicts ────────
+
+test("argv arrays keep argument boundaries through the shell check", () => {
+  // "meeting; reboot" is ONE argv element — not a shutdown command.
+  const benign = analyzer.analyze(
+    'spawnSync("printf", ["meeting; reboot"]);',
+    "js",
+  );
+  assert.ok(!benign.behaviors.includes("shutdown-reboot"), benign.behaviors.join(","));
+  assert.equal(benign.hardBlocked, false);
+
+  // A real shutdown argv still flags.
+  const shutdown = analyzer.analyze('spawnSync("shutdown", ["-h", "now"]);', "js");
+  assert.ok(shutdown.behaviors.includes("shutdown-reboot"));
+
+  // Inner hard blocks propagate: bash -c with a destructive payload.
+  const destructive = analyzer.analyze(
+    'spawnSync("bash", ["-c", "rm -rf /"]);',
+    "js",
+  );
+  assert.equal(destructive.hardBlocked, true);
+});
+
+test("python !-shell tracks cd across segments and merges deny tiers", () => {
+  // !cd /etc switches the shell cwd: chmod there is system → hard.
+  const sys = analyzer.analyze("!cd /etc\n!chmod 777 foo", "python");
+  assert.ok(sys.behaviors.includes("permission-change-system"));
+  assert.equal(sys.hardBlocked, true);
+
+  // !cd into a user dir keeps chmod user-tier — not blocked.
+  const user = analyzer.analyze("!cd /tmp\n!chmod 777 foo", "python");
+  assert.ok(!user.behaviors.includes("permission-change-system"), user.behaviors.join(","));
+  assert.equal(user.hardBlocked, false);
+
+  // Inner deny-tier verdicts survive the eval hop (git force push).
+  const deny = analyzer.analyze("!git push -f origin main", "python");
+  assert.equal(deny.denyTier, true);
+});

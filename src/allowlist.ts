@@ -71,7 +71,7 @@ export class AllowList {
    * relative, and symlinked targets (B4).  Undeterminable targets make the
    * domain check fail so the command falls back to normal approval.
    */
-  isAllowed(tool: string, content: string, cwd: string): boolean {
+  isAllowed(tool: string, content: string, cwd: string, analysisCwd = cwd): boolean {
     const key = makeAllowKey(tool, content, cwd);
     if (this.sessionAllows.has(key)) return true;
     const normalized = tool === "bash" ? normalize(content) : path.resolve(cwd, content);
@@ -80,7 +80,7 @@ export class AllowList {
       const scoped = typeof e.pattern === "string" || typeof e.domain === "string";
       if (!scoped) return e.key === normalized && e.cwd === cwd;
       if (typeof e.pattern === "string" && !matchCommandGlob(e.pattern, normalized)) return false;
-      if (typeof e.domain === "string" && !this.allTargetsWithinDomain(tool, content, e, cwd)) {
+      if (typeof e.domain === "string" && !this.allTargetsWithinDomain(tool, content, e, cwd, analysisCwd)) {
         return false;
       }
       return true;
@@ -99,6 +99,7 @@ export class AllowList {
     content: string,
     entry: AllowEntry,
     cwd: string,
+    analysisCwd: string,
   ): boolean {
     const domain = resolveFilesystemPathCandidates(entry.domain ?? "", entry.cwd);
     const withinDomain = (candidate: string): boolean =>
@@ -112,10 +113,14 @@ export class AllowList {
     };
 
     if (tool !== "bash") {
+      // The subject is a filesystem target only when the tool actually
+      // operates on a single path (write/edit tools) — not for tools whose
+      // subject is source code or free text (eval, notebook cells), which
+      if (!looksLikeSinglePath(content)) return false;
       return resolvesInside(path.resolve(cwd, content), cwd);
     }
 
-    const { targets, undeterminable } = commandFileTargets(content, cwd);
+    const { targets, undeterminable } = commandFileTargets(content, analysisCwd);
     if (undeterminable) return false;
     if (targets.length === 0) {
       return resolveFilesystemPathCandidates(cwd, cwd).every(withinDomain);
@@ -142,4 +147,15 @@ export class AllowList {
     this.permanent.push(entry);
     this.savePermanent();
   }
+}
+
+/** A tool subject counts as a single path only when it reads like one —
+ *  no whitespace/newlines, no shell metacharacters (R2). */
+function looksLikeSinglePath(content: string): boolean {
+  const trimmed = content.trim();
+  return (
+    trimmed.length > 0 &&
+    trimmed === content &&
+    !/[\s;&|()<>$`"'\\]/.test(trimmed)
+  );
 }

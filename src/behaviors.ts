@@ -335,7 +335,7 @@ function stripShellSubstitutions(
 function commandAndArgs(
   segment: string,
   options: { unwrapXargs?: boolean } = {},
-): { name: string; args: string[] } | undefined {
+): CommandInvocation | undefined {
   const tokens = roughTokenize(segment);
   let index = 0;
 
@@ -410,6 +410,7 @@ function commandAndArgs(
     return {
       name,
       args: tokens.slice(index + 1).map(unquoteToken),
+      rawArgs: tokens.slice(index + 1),
     };
   }
 
@@ -436,7 +437,9 @@ function findExecCommands(args: string[]): string[][] {
   return commands;
 }
 
-function quoteShellArgument(value: string): string {
+/** Quote one argv element as a single-quoted shell token.  Shared with the
+ *  eval analyzer so argv-array spawns keep their argument boundaries (R4). */
+export function quoteShellArgument(value: string): string {
   return `'${value.replace(/'/g, `'\"'\"'`)}'`;
 }
 
@@ -722,6 +725,26 @@ const POSIX_SHELLS: Record<string, true> = {
 interface CommandInvocation {
   name: string;
   args: string[];
+  /** Raw token text per arg: `'…'`-quoted operands are literal and must not
+   *  get HOME/tilde expansion (R6). */
+  rawArgs: string[];
+}
+
+interface PathArg {
+  value: string;
+  /** True when the token was fully single-quoted (literal `$HOME`, `~`). */
+  literal: boolean;
+}
+
+function pathArg(rawToken: string | undefined): PathArg {
+  const raw = rawToken ?? "";
+  const singleQuoted = raw.length >= 2 && raw.startsWith("'") && raw.endsWith("'");
+  const doubleQuoted = raw.length >= 2 && raw.startsWith("\"") && raw.endsWith("\"");
+  const value = unquoteToken(raw);
+  // Single quotes freeze everything; double quotes still allow $HOME but
+  // never tilde expansion — `"~"` is a literal name (R6).
+  const literal = singleQuoted || (doubleQuoted && /^~($|\/)/.test(value));
+  return { value, literal };
 }
 
 /** Split at ;, &&, ||, newline, bare & and parens — but NOT single `|`
@@ -825,15 +848,39 @@ function innerWrappedCommand(invocation: CommandInvocation): string | undefined 
       if (optionWithValue.has(arg)) { i += 2; continue; }
       i++;
     }
-    // First operand is user@host; the rest is the remote command line.
-    return args.slice(i + 1).map((arg) => /\s/.test(arg) ? quoteShellArgument(arg) : arg).join(" ") || undefined;
+    // First operand is user@host.  The remote side joins its argv into a
+    // shell command line, so re-quoting every operand would collapse the
+    // whole remote command into one program name (R4); join plainly.
+    return args.slice(i + 1).join(" ") || undefined;
   }
   if (POSIX_SHELLS[name] === true) {
     for (let i = 0; i < args.length; i++) {
-      if (args[i] === "-c" && args[i + 1] !== undefined) return args[i + 1];
+      const arg = args[i];
+      // `c` ends a short-option cluster: `-c` and combined `-xc`/`-lc`
+      // both carry a literal script operand (R4).
+      const scriptOption =
+        arg === "-c" || (/^-[^-]*c$/.test(arg) && arg.length > 2);
+      if (scriptOption && args[i + 1] !== undefined) return args[i + 1];
     }
   }
   return undefined;
+}
+
+/**
+ * The program a pipeline stage actually executes, for remote-fetch-exec
+ * adjacency (R1): env wrappers and sudo/doas unwrap to their inner program;
+ * `xargs` keeps its own identity (piped data become arguments, not a script);
+ * POSIX `-c` text is not unwrapped here — the stage head is the shell.
+ */
+function pipeStageProgram(segment: string): string | undefined {
+  const invocation = commandAndArgs(segment, { unwrapXargs: false });
+  if (!invocation) return undefined;
+  if (invocation.name === "sudo" || invocation.name === "doas") {
+    const inner = innerWrappedCommand(invocation);
+    if (inner === undefined) return invocation.name;
+    return commandAndArgs(inner, { unwrapXargs: false })?.name;
+  }
+  return invocation.name;
 }
 
 /** Expand the HOME forms resolvable without running the shell (~, $HOME,
@@ -860,58 +907,97 @@ function expandHomeLiteral(value: string, home: string): string | undefined {
  */
 function semanticPathCandidates(target: string, baseCwd: string): string[] {
   const lexical = resolveFilesystemPathCandidates(target, baseCwd);
-  const absolute = lexical[0];
-  if (!absolute || absolute.startsWith("/") === false) return lexical;
-  const parts = absolute.split("/").filter(Boolean);
+  if (!path.isAbsolute(target) && !path.isAbsolute(baseCwd)) return lexical;
+  const absolute = path.isAbsolute(target) ? target : `${baseCwd}/${target}`;
+  // Original components (pre-`..` folding) so a `..` right after a symlinked
+  // directory escapes the link target — realpath semantics (R3).
+  const parts = absolute.split("/").filter((part) => part !== "" && part !== ".");
   let current = "/";
-  try {
-    for (const part of parts) {
-      if (part === "..") {
-        current = path.dirname(fs.realpathSync(current));
-        continue;
+  let resolved = 0; // components of `parts` already folded into `current`
+  for (const part of parts) {
+    if (part === "..") {
+      try {
+        current = fs.realpathSync(path.dirname(current));
+      } catch {
+        current = path.dirname(current);
       }
-      current = fs.realpathSync(path.join(current, part));
+      resolved++;
+      continue;
     }
-  } catch {
-    return lexical;
+    try {
+      current = fs.realpathSync(`${current}/${part}`);
+      resolved++;
+    } catch {
+      break; // missing tail — the resolved prefix still holds
+    }
   }
-  return current === absolute ? [absolute] : [absolute, current];
+  if (resolved === 0) return lexical;
+  const semantic = [current, ...parts.slice(resolved)].join("/");
+  const lexicalAbsolute = lexical[0] ?? absolute;
+  return semantic === lexicalAbsolute ? [lexicalAbsolute] : [lexicalAbsolute, semantic];
 }
 
 function isSystemTarget(value: string): boolean {
   return value === "/" || PERMISSION_SYSTEM_PATH_RE.test(value);
 }
 
+/** Recognized option clusters for the permission tools; anything else
+ *  starting with `-` is an operand (e.g. the symbolic mode `-w`, R6). */
+const PERMISSION_SHORT_OPTIONS_RE = /^-[RvcfHLPdhn]+$/;
+
 /** chmod/chown/chgrp operands with tool grammar: option args and the
- *  leading MODE / OWNER[:GROUP] / GROUP / --reference operands excluded. */
-function permissionTargets(name: string, args: string[]): { targets: string[]; owner?: string } {
+ *  leading MODE / OWNER[:GROUP] / GROUP operand are identified by role —
+ *  `--reference` removes the role operand entirely; `chown --reference`
+ *  carries the reference file as `reference` (its owner is dynamic; R6). */
+function permissionTargets(
+  invocation: CommandInvocation,
+): { targets: PathArg[]; owner?: string; reference?: PathArg } {
+  const { name, args, rawArgs } = invocation;
   let i = 0;
   let skipFirstOperand = true;
-  const targets: string[] = [];
-  let owner: string | undefined;
+  let reference: PathArg | undefined;
   while (i < args.length) {
     const arg = args[i];
     if (arg === "--") { i++; break; }
-    if (!arg.startsWith("-")) break;
-    if (arg.startsWith("--reference=")) { skipFirstOperand = false; i++; continue; }
-    if (arg === "--reference") { skipFirstOperand = false; i += 2; continue; }
-    i++;
+    if (arg.startsWith("--")) {
+      if (arg.startsWith("--reference=")) {
+        reference = pathArg(rawArgs[i]?.slice("--reference=".length));
+        skipFirstOperand = false;
+        i++;
+        continue;
+      }
+      if (arg === "--reference") {
+        reference = pathArg(rawArgs[i + 1]);
+        skipFirstOperand = false;
+        i += 2;
+        continue;
+      }
+      // Long options without a value (--recursive, --silent, …).
+      i++;
+      continue;
+    }
+    if (arg.startsWith("-") && PERMISSION_SHORT_OPTIONS_RE.test(arg)) { i++; continue; }
+    break;
   }
-  const operands = args.slice(i);
-  const list = skipFirstOperand ? operands.slice(1) : operands;
+  const operandArgs = args.slice(i).map((_, j) => pathArg(rawArgs[i + j]));
+  const list = skipFirstOperand ? operandArgs.slice(1) : operandArgs;
+  let owner: string | undefined;
   if (name === "chown" && skipFirstOperand) {
-    const spec = operands[0];
+    const spec = operandArgs[0]?.value;
     const ownerPart = spec?.split(":")[0];
     owner = ownerPart === "" ? undefined : ownerPart;
   }
-  return { targets: list, owner };
+  return { targets: list, owner, reference };
 }
 
 /**
  * Classify one chmod/chown/chgrp invocation by target domain.  `cwd` is the
  * effective cwd at the segment executing it.  Targets are expanded for ~ and
- * $HOME, resolved with realpath semantics, and checked for system dirs, the
- * root dir, and the home root.  Unknown targets stay reviewable.
+ * $HOME (single-quoted literals stay literal — R6), resolved with realpath
+ * semantics, and checked for system dirs, the root dir, and the home root.
+ * `chown --reference FILE` takes FILE's owner: a stat-able file with a
+ * different uid is system, an unresolvable reference leaves the owner
+ * undetermined (the caller treats it like a reviewable unknown — R6).
  */
 function permissionChangeTier(
   invocation: CommandInvocation,
@@ -920,16 +1006,36 @@ function permissionChangeTier(
   home = process.env.HOME || os.homedir(),
   user = process.env.USER || os.userInfo().username,
 ): "permission-change-system" | "permission-change-user" {
-  const { name, args } = invocation;
-  const { targets, owner } = permissionTargets(name, args);
+  const { name } = invocation;
+  const { targets, owner, reference } = permissionTargets(invocation);
 
-  if (name === "chown" && owner !== undefined && owner !== user) {
-    return "permission-change-system";
+  if (name === "chown" || name === "chgrp") {
+    if (owner !== undefined && owner !== user) {
+      return "permission-change-system";
+    }
+    if (reference !== undefined) {
+      const refPath = expandPathTarget(reference, home);
+      let refOther = false;
+      if (refPath !== undefined) {
+        const refCandidates = cwdKnown
+          ? semanticPathCandidates(refPath, cwd)
+          : [refPath];
+        try {
+          const stat = fs.statSync(refCandidates[refCandidates.length - 1] ?? refPath);
+          refOther = name === "chgrp"
+            ? !(process.getgroups?.() ?? [process.getgid?.() ?? -1]).includes(stat.gid)
+            : stat.uid !== (process.getuid?.() ?? -1);
+        } catch {
+          refOther = false; // unresolvable reference → reviewable unknown
+        }
+        if (refOther) return "permission-change-system";
+      }
+    }
   }
 
   const homeCandidates = resolveFilesystemPathCandidates(home, home);
-  for (const raw of targets) {
-    const expanded = expandHomeLiteral(raw, home);
+  for (const target of targets) {
+    const expanded = expandPathTarget(target, home);
     if (expanded === undefined) continue; // dynamic — reviewable, LLM judges
     if (isSystemTarget(expanded)) return "permission-change-system";
     const candidates = cwdKnown
@@ -945,20 +1051,57 @@ function permissionChangeTier(
   return "permission-change-user";
 }
 
+/** Expand a PathArg: literal (single-quoted) values pass through untouched;
+ *  unquoted values get the static HOME/tilde expansion (R6). */
+function expandPathTarget(target: PathArg, home: string): string | undefined {
+  if (target.literal) return target.value === "" ? undefined : target.value;
+  return expandHomeLiteral(target.value, home);
+}
+
 /**
  * Filesystem targets of one stage for domain-scoped allow entries.
  * `complete:false` means the operand grammar wasn't fully understood —
  * the domain entry must not match (falls back to normal approval).
  */
+/** Options whose VALUE is a filesystem path (output/config/input files). */
 const FILE_OPTION_VALUE: Record<string, ReadonlySet<string>> = {
   tar: new Set(["-f", "--file", "-C", "--directory"]),
-  curl: new Set(["-o", "--output", "-O", "--remote-name"]),
-  wget: new Set(["-O", "--output-document", "-P", "--directory-prefix"]),
+  curl: new Set(["-o", "--output", "-T", "--upload-file",
+    "-K", "--config", "--cacert", "--cert", "--key", "-E",
+    "-b", "--cookie", "-c", "--cookie-jar"]),
+  wget: new Set(["-O", "--output-document", "-P", "--directory-prefix",
+    "-i", "--input-file", "--ca-certificate", "--certificate", "--private-key",
+    "--ca-directory", "--post-file", "--load-cookies", "--save-cookies"]),
+  sort: new Set(["-o", "--output", "-T", "--temporary-directory",
+    "--random-source", "--files0-from"]),
+  git: new Set(["-C", "--git-dir", "--work-tree", "-c"]),
+  ssh: new Set(["-i", "-F"]),
+};
+
+/** Options that take a non-file value — skipped wholesale. */
+const NONFILE_OPTION_VALUE: Record<string, ReadonlySet<string>> = {
+  curl: new Set(["-A", "--user-agent", "-H", "--header", "-d", "--data",
+    "--data-raw", "--data-binary", "--data-urlencode", "-F", "--form",
+    "-u", "--user", "-x", "--proxy", "-X", "--request", "--connect-timeout",
+    "-m", "--max-time", "--retry", "-e", "--referer",
+    "--resolve", "--limit-rate", "--range",
+    "--dns-servers", "--interface", "--local-port", "--ciphers"]),
+  wget: new Set(["--header", "--post-data", "--user",
+    "--password", "--timeout", "--tries", "--wait", "--limit-rate",
+    "--bind-address", "--referer", "--user-agent",
+    "-e", "--execute", "-U"]),
   find: new Set(["-path", "-name", "-iname", "-type", "-perm", "-user", "-group",
     "-size", "-newer", "-regex", "-maxdepth", "-mindepth", "-exec", "-execdir", "-ok", "-okdir"]),
-  sort: new Set(["-k", "-t", "-n", "-o"]),
-  git: new Set(["-C", "--git-dir", "--work-tree", "-c"]),
+  sort: new Set(["-k", "-t", "-S", "--buffer-size",
+    "--compress-program", "--parallel"]),
+  ssh: new Set(["-b", "-c", "-D", "-E", "-e", "-I", "-J", "-L", "-l", "-m",
+    "-O", "-o", "-p", "-Q", "-R", "-S", "-W", "-w"]),
 };
+
+/** Remote operands (URL / scp-style host:path / rsync host::module) are not
+ *  filesystem targets; anything else on a network tool is undeterminable. */
+const REMOTE_OPERAND_RE =
+  /^(?:[A-Za-z][A-Za-z0-9+.-]*:\/\/|[A-Za-z][A-Za-z0-9+.-]*:|\w[\w.-]*@[\w.-]+:|[^/]+::)/;
 
 /** Commands whose operands are never filesystem paths for domain scoping. */
 const NON_FILE_COMMANDS: ReadonlySet<string> = new Set([
@@ -971,7 +1114,7 @@ const NON_FILE_COMMANDS: ReadonlySet<string> = new Set([
   "xargs", "nohup", "nice", "timeout", "watch", "clear", "reset",
   "git", "gh", "npm", "npx", "pnpm", "yarn", "bun", "deno", "pip", "pip3",
   "python3", "python", "node", "ruby", "perl", "php", "lua", "docker",
-  "kubectl", "systemctl", "service", "curl", "wget", "ssh", "scp", "rsync",
+  "kubectl", "systemctl", "service", "scp",
   "openssl", "nc", "netcat", "ncat", "socat", "telnet", "ping", "dig",
   "nslookup", "host", "traceroute", "grep", "rg", "egrep", "fgrep", "sed",
   "awk", "gawk", "diff", "wc", "sort", "uniq", "comm", "cut", "tr", "head",
@@ -979,22 +1122,22 @@ const NON_FILE_COMMANDS: ReadonlySet<string> = new Set([
 ]);
 
 interface FileTargetResult {
-  targets: string[];
+  targets: PathArg[];
   /** False → operand grammar unclear; domain entries must not apply. */
   complete: boolean;
 }
 
-/** Operands of a stage, honoring `--` and flag-value skipping. */
-function stageOperands(
-  name: string,
-  args: string[],
+/** Operand PathArgs of a stage, honoring `--` and known option values. */
+function stagePathArgs(
+  rawArgs: string[],
   optionWithValue?: ReadonlySet<string>,
-): string[] {
-  const operands: string[] = [];
+): PathArg[] {
+  const operands: PathArg[] = [];
   let i = 0;
   let optionsDone = false;
-  while (i < args.length) {
-    const arg = args[i];
+  while (i < rawArgs.length) {
+    const raw = rawArgs[i];
+    const arg = unquoteToken(raw);
     if (!optionsDone && arg === "--") { optionsDone = true; i++; continue; }
     if (!optionsDone && arg.startsWith("-")) {
       if (optionWithValue?.has(arg)) { i += 2; continue; }
@@ -1002,54 +1145,109 @@ function stageOperands(
       i++;
       continue;
     }
-    operands.push(arg);
+    operands.push(pathArg(raw));
     i++;
   }
   return operands;
 }
 
-function fileTargetsOfInvocation(
+/** File-valued option arguments of a stage (output files, config files,
+ *  upload sources — R2: download output options count as targets). */
+function stageFileOptionTargets(
   name: string,
-  args: string[],
+  rawArgs: string[],
+): { targets: PathArg[]; complete: boolean } {
+  const targets: PathArg[] = [];
+  const fileOpts = FILE_OPTION_VALUE[name];
+  const nonfileOpts = NONFILE_OPTION_VALUE[name];
+  let complete = true;
+  let i = 0;
+  while (i < rawArgs.length) {
+    const arg = unquoteToken(rawArgs[i]);
+    if (arg === "--") break;
+    if (!arg.startsWith("-")) { i++; continue; }
+    if (arg.includes("=")) {
+      const eq = arg.indexOf("=");
+      if (fileOpts?.has(arg.slice(0, eq))) {
+        targets.push({ value: arg.slice(eq + 1), literal: false });
+      }
+      i++;
+      continue;
+    }
+    if (fileOpts?.has(arg)) {
+      if (rawArgs[i + 1] === undefined) complete = false;
+      else targets.push(pathArg(rawArgs[i + 1]));
+      i += 2;
+      continue;
+    }
+    if (nonfileOpts?.has(arg)) { i += 2; continue; }
+    i++;
+  }
+  return { targets, complete };
+}
+
+function fileTargetsOfInvocation(
+  invocation: CommandInvocation,
 ): FileTargetResult {
+  const { name, args, rawArgs } = invocation;
   if (name === "dd") {
     const values = args
       .filter((arg) => /^(?:of|if)=/.test(arg))
-      .map((arg) => arg.slice(arg.indexOf("=") + 1));
+      .map((arg) => ({ value: arg.slice(arg.indexOf("=") + 1), literal: false }));
     return { targets: values, complete: true };
   }
   if (["chmod", "chown", "chgrp"].includes(name)) {
-    return { targets: permissionTargets(name, args).targets, complete: true };
+    const result = permissionTargets(invocation);
+    const targets = [...result.targets];
+    if (result.reference) targets.push(result.reference);
+    return { targets, complete: true };
   }
   if (name === "scp") {
-    const operands = stageOperands(name, args);
+    const operands = stagePathArgs(rawArgs);
     return {
-      targets: operands.filter((arg) => !/^[A-Za-z][A-Za-z0-9+.-]*:/.test(arg) &&
-        !/^[^/]*:/.test(arg)),
+      targets: operands.filter((arg) => !/^[^/]*:/.test(arg.value)),
       complete: true,
     };
   }
+  if (name === "ssh") {
+    // Only file-valued options are local paths; the remote command is remote.
+    const { targets, complete } = stageFileOptionTargets(name, rawArgs);
+    return { targets, complete };
+  }
+  if (name === "curl" || name === "wget") {
+    // Network fetchers: file targets are the OPTION values (-o/-O/-i/…);
+    // bare operands are URLs, not paths.  `@file` operands of -d/-F/--form
+    // read a local file too (R2).
+    const { targets, complete } = stageFileOptionTargets(name, rawArgs);
+    for (let i = 0; i < rawArgs.length; i++) {
+      const arg = unquoteToken(rawArgs[i]);
+      if (["-d", "--data", "--data-raw", "--data-binary", "-F", "--form"].includes(arg)) {
+        const value = unquoteToken(rawArgs[i + 1] ?? "");
+        if (value.startsWith("@")) targets.push(pathArg(rawArgs[i + 1]));
+        i++;
+      }
+    }
+    const remoteOnly = stagePathArgs(rawArgs).every(
+      (operand) => REMOTE_OPERAND_RE.test(operand.value) ||
+        /^[A-Za-z][A-Za-z0-9+.-]*(?::\d+)?\//.test(operand.value) ||
+        operand.value.includes("."),
+    );
+    return { targets, complete: complete && remoteOnly };
+  }
   if (name === "tee") {
-    const operands = stageOperands(name, args);
+    const operands = stagePathArgs(rawArgs);
     return { targets: operands, complete: true };
   }
   if (name === "tar") {
-    const values: string[] = [];
-    const skip = FILE_OPTION_VALUE.tar;
-    let i = 0;
-    while (i < args.length) {
-      const arg = args[i];
-      if (arg === "--") break;
-      if (skip?.has(arg)) {
-        if (["-f", "--file", "-C", "--directory"].includes(arg) && args[i + 1] !== undefined) {
-          values.push(args[i + 1]);
-        }
-        i += 2;
-        continue;
-      }
-      i++;
-    }
-    return { targets: values, complete: true };
+    const { targets, complete } = stageFileOptionTargets(name, rawArgs);
+    const operands = stagePathArgs(rawArgs, FILE_OPTION_VALUE.tar);
+    // A leading non-dash operand is the action bundle (`xf`, `czf`); with
+    // `-x` style flags every operand is a path (archive or member).
+    const leadingAction = args[0] !== undefined && !args[0].startsWith("-");
+    return {
+      targets: [...targets, ...(leadingAction ? operands.slice(1) : operands)],
+      complete,
+    };
   }
   if (NON_FILE_COMMANDS.has(name)) return { targets: [], complete: true };
 
@@ -1063,12 +1261,14 @@ function fileTargetsOfInvocation(
     "vi", "nano", "emacs", "code", "open", "xdg-open", "gpg", "git-add",
   ]);
   if (FILE_COMMANDS.has(name)) {
-    const skip = FILE_OPTION_VALUE[name];
-    const operands = stageOperands(name, args, skip);
-    return { targets: operands, complete: true };
+    const skip = new Set<string>([...(FILE_OPTION_VALUE[name] ?? [])]);
+    for (const option of NONFILE_OPTION_VALUE[name] ?? []) skip.add(option);
+    const { targets: optionTargets, complete } = stageFileOptionTargets(name, rawArgs);
+    const operands = stagePathArgs(rawArgs, skip);
+    return { targets: [...optionTargets, ...operands], complete };
   }
   // Unknown command with operands: cannot prove domain membership.
-  const operands = stageOperands(name, args);
+  const operands = stagePathArgs(rawArgs);
   return { targets: [], complete: operands.length === 0 };
 }
 
@@ -1111,6 +1311,8 @@ export function commandFileTargets(
         const inner = innerWrappedCommand(invocation);
         if (inner !== undefined) {
           pending.push({ text: inner, cwd: currentCwd, cwdKnown });
+        } else if (name === "sudo" || name === "doas" || name === "ssh") {
+          undeterminable = true; // wrapper whose inner command can't be proven
         }
         if (name === "find") {
           for (const commandArgs of findExecCommands(args)) {
@@ -1123,9 +1325,12 @@ export function commandFileTargets(
         }
 
         if (name === "cd") {
-          const operand = args.find((arg) => arg !== "--" && !arg.startsWith("-"));
+          const index = args.findIndex((arg) => arg !== "--" && !arg.startsWith("-"));
           const home = process.env.HOME || os.homedir();
-          const expanded = operand === undefined ? home : expandHomeLiteral(operand, home);
+          const operand = index >= 0 ? pathArg(invocation.rawArgs[index]) : undefined;
+          const expanded = operand === undefined
+            ? home
+            : expandPathTarget(operand, home);
           if (expanded === undefined || !cwdKnown) {
             cwdKnown = false;
             continue;
@@ -1135,14 +1340,27 @@ export function commandFileTargets(
           continue;
         }
 
-        const result = fileTargetsOfInvocation(name, args);
+        const result = fileTargetsOfInvocation(invocation);
         if (!result.complete) undeterminable = true;
+        const home = process.env.HOME || os.homedir();
         for (const target of result.targets) {
-          const expanded = expandHomeLiteral(target, process.env.HOME || os.homedir());
+          const expanded = expandPathTarget(target, home);
           if (expanded === undefined) {
             undeterminable = true;
             continue;
           }
+          targets.push({ value: expanded, cwd: currentCwd });
+        }
+
+        // Redirection targets are filesystem targets too (R2); /dev/null
+        // is the universal sink and carries no domain risk.
+        for (const raw of redirectionTargets(stage)) {
+          const expanded = expandHomeLiteral(raw, home);
+          if (expanded === undefined) {
+            undeterminable = true;
+            continue;
+          }
+          if (expanded === "/dev/null") continue;
           targets.push({ value: expanded, cwd: currentCwd });
         }
       }
@@ -1494,30 +1712,23 @@ export function analyzeCommand(cmd: string): DangerAnalysis {
     for (const group of commandGroups(executableCommand)) {
       const stages = pipeStages(group);
 
-      // A pipe whose right side executes an interpreter is remote-fetch-exec:
-      // curl|wget|fetch|echo|printf data piped straight into sh/python/….
-      // Judged on the actual parsed stage programs (basename semantics),
-      // so /usr/bin/curl, quoted args, and `curl x; sh -c y` behave correctly.
-      if (stages.length >= 2) {
-        // Direct interpreter execution only: `… | xargs bash -n` runs a fixed
-        // script with piped data as arguments, not a fetched script, so xargs
-        // is not unwrapped at the pipe's right end.
-        const last = commandAndArgs(stages[stages.length - 1], { unwrapXargs: false });
-        if (last && (PIPE_INTERPRETERS[last.name] === true ||
-          ((last.name === "sudo" || last.name === "doas") &&
-            (() => {
-              const inner = innerWrappedCommand(last);
-              if (!inner) return false;
-              const innerInvocation = commandAndArgs(inner, { unwrapXargs: false });
-              return innerInvocation !== undefined && PIPE_INTERPRETERS[innerInvocation.name] === true;
-            })()))) {
-          for (let index = 0; index < stages.length - 1; index++) {
-            const source = commandAndArgs(stages[index]);
-            if (source && ["curl", "wget", "fetch", "echo", "printf"].includes(source.name)) {
-              behaviorSet.add("remote-fetch-exec");
-              break;
-            }
-          }
+      // remote-fetch-exec is judged on truly ADJACENT pairs (R1): a
+      // fetch/source stage immediately feeding an interpreter stage.
+      // Both ends use the executed program's basename — env wrappers and
+      // sudo/doas unwrap, xargs does not — so `/usr/bin/curl x | /bin/sh`,
+      // `sudo curl x | sh`, and `curl x | sudo sh` all match, while
+      // `curl x; sh -c y` (independent commands) and quoted text do not.
+      for (let index = 0; index + 1 < stages.length; index++) {
+        const source = pipeStageProgram(stages[index]);
+        const sink = pipeStageProgram(stages[index + 1]);
+        if (
+          source !== undefined &&
+          sink !== undefined &&
+          ["curl", "wget", "fetch", "echo", "printf"].includes(source) &&
+          PIPE_INTERPRETERS[sink] === true
+        ) {
+          behaviorSet.add("remote-fetch-exec");
+          break;
         }
       }
 
@@ -1739,9 +1950,10 @@ export function analyzeBashOperation(
         }
 
         if (name === "cd") {
-          const operand = args.find((arg) => arg !== "--" && !arg.startsWith("-"));
+          const index = args.findIndex((arg) => arg !== "--" && !arg.startsWith("-"));
           const home = process.env.HOME || os.homedir();
-          const expanded = operand === undefined ? home : expandHomeLiteral(operand, home);
+          const operand = index >= 0 ? pathArg(invocation.rawArgs[index]) : undefined;
+          const expanded = operand === undefined ? home : expandPathTarget(operand, home);
           if (expanded === undefined || !cwdKnown) {
             cwdKnown = false;
             continue;
@@ -1756,8 +1968,13 @@ export function analyzeBashOperation(
         }
 
         if (name === "dd") {
-          for (const arg of args.filter((value) => /^of=/.test(value))) {
-            const expanded = expandHomeLiteral(arg.slice(3), process.env.HOME || os.homedir());
+          for (let ai = 0; ai < args.length; ai++) {
+            if (!/^of=/.test(args[ai])) continue;
+            const ddTarget = pathArg(invocation.rawArgs[ai].slice(invocation.rawArgs[ai].indexOf("=") + 1));
+            const expanded = expandPathTarget(
+              ddTarget,
+              process.env.HOME || os.homedir(),
+            );
             if (expanded === undefined) {
               behaviorSet.add("dd-write");
               continue;

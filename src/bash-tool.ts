@@ -465,7 +465,10 @@ export class BashToolGate extends ToolGate {
     const sessionBase = path.resolve(ctx.cwd || process.cwd());
     const sessionCandidates = resolveFilesystemPathCandidates(sessionBase, sessionBase);
     const sessionCwd = sessionCandidates[sessionCandidates.length - 1] ?? sessionBase;
+<<<<<<< HEAD
 
+=======
+>>>>>>> f400321 (fix(policy): address review R2 — adjacency, target extraction, realpath semantics, argv boundaries, glob scope, permission operands)
     // R3: the analyzer receives the cwd in effect BEFORE the command's own
     // leading `cd` — it re-applies that transition itself per segment, so
     // feeding it the already-switched cwd would apply `cd` twice.
