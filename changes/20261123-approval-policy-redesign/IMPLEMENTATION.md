@@ -477,3 +477,24 @@ $ bun run build       # dist/index.js 225.78 KB
 ```
 
 **偏差**：无。
+
+## 二十三、复审修正 R17（对应 REVIEW.md「第十七轮终审 · 97c6536」M1）
+
+复审对象：`97c6536`。K1 已关闭；本轮 M1 必修交付。
+
+| 项 | 修正 | 断言 |
+|----|------|------|
+| M1（拼接后的整行才与分隔词比较） | 未引用正文先拼接续行组成逻辑行，再与当前分隔词比较：`\`+`EOF` 拼成 `EOF` 恰好闭合；`abc\`+`EOF` 拼成 `abcEOF` 继续正文；偶数反斜杠不拼接；引用正文保持逐物理行字面比较 | `joined logical body lines are compared against the delimiter (M1)` 四组：拼接等于分隔词→闭合并登记 `after`；拼接不等于→未闭合且无虚构目标；`\\` 偶数反斜杠不拼接正常闭合；引用正文同写法即闭合 |
+
+**复审修正 R17 后验证**：
+
+```
+$ bun run typecheck   # tsc --noEmit → clean
+$ bun test src
+ 284 pass
+ 0 fail
+Ran 284 tests across 14 files.
+$ bun run build       # dist/index.js 225.95 KB
+```
+
+**偏差**：无。
