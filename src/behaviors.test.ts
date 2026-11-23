@@ -961,3 +961,78 @@ test("mixed escape + dynamic remainder is undeterminable, not frozen (V5)", () =
   assert.deepEqual(plain.targets.map((t) => t.value), ["~file"]);
   assert.equal(plain.undeterminable, false);
 });
+
+test("fd duplication is decided on the whole word, not the first char (X1)", () => {
+  // 2026.log is a file even though it starts with a digit.
+  assert.deepEqual(
+    commandFileTargets("echo hi >&2026.log", "/tmp").targets.map((t) => t.value),
+    ["2026.log"],
+  );
+  assert.deepEqual(
+    commandFileTargets("echo hi 2>&2026.log", "/tmp").targets.map((t) => t.value),
+    ["2026.log"],
+  );
+  // Pure digits stay fd duplications.
+  assert.deepEqual(commandFileTargets("echo hi >&2", "/tmp").targets, []);
+  assert.deepEqual(commandFileTargets("echo hi 2>&1", "/tmp").targets, []);
+  // `=` inside a short cluster is a filename character.
+  assert.deepEqual(
+    commandFileTargets("sort -oreport=1.tsv in.tsv", "/tmp").targets.map((t) => t.value).sort(),
+    ["in.tsv", "report=1.tsv"],
+  );
+});
+
+test("|& is a real two-stage pipe for adjacency classification (X2)", () => {
+  // printf |& sh has the same fetcher→shell adjacency as printf | sh.
+  const piped = analyzeCommand("printf a |& wc -c");
+  const plain = analyzeCommand("printf a | wc -c");
+  assert.equal(piped.hardBlocked, plain.hardBlocked);
+  const evil = analyzeCommand("printf a |& sh");
+  assert.equal(evil.hardBlocked, analyzeCommand("printf a | sh").hardBlocked);
+});
+
+test("input redirection operands keep their leading characters (X3)", () => {
+  // `-notes.tsv` is a legitimate filename — no heredoc modifier may eat it.
+  assert.deepEqual(
+    commandFileTargets("cat < -notes.tsv", "/tmp").targets.map((t) => t.value),
+    ["-notes.tsv"],
+  );
+  // Both spellings point at the same file.
+  assert.deepEqual(
+    commandFileTargets("cat <-notes.tsv", "/tmp").targets.map((t) => t.value),
+    ["-notes.tsv"],
+  );
+});
+
+test("heredoc bodies and here-strings stay data, never commands or paths (X4)", () => {
+  // The body's `cat report.tsv` line is literal text — report.tsv is not a
+  // target and the line never runs as a zero-arg command.
+  const heredoc = commandFileTargets(
+    "cat <<'EOF'\ncat report.tsv\nEOF\n",
+    "/tmp",
+  );
+  assert.deepEqual(heredoc.targets, []);
+  assert.equal(heredoc.undeterminable, false);
+  // A real command after the body is still analyzed.
+  const after = commandFileTargets(
+    "cat <<'EOF'\ncat report.tsv\nEOF\nsort real.tsv\n",
+    "/tmp",
+  );
+  assert.deepEqual(after.targets.map((t) => t.value), ["real.tsv"]);
+  // Here-string operand is data, not a file.
+  assert.deepEqual(
+    commandFileTargets("cat <<< 'meeting minutes'", "/tmp").targets,
+    [],
+  );
+  // And the heredoc body must not spawn a behavior from its own text.
+  const body = analyzeCommand("cat <<'EOF'\nrm -rf /\nEOF\n");
+  assert.ok(!body.behaviors.includes("recursive-force-delete"),
+    "heredoc body text is not executed");
+});
+
+test("tilde mixed with variable in one operand is undeterminable (X5)", () => {
+  for (const form of [">\\~$HOME/x", ">\\~/$VAR", ">~$VAR"]) {
+    const r = commandFileTargets(`echo hi ${form}`, "/tmp");
+    assert.equal(r.undeterminable, true, `${form} must not resolve to a wrong absolute path`);
+  }
+});

@@ -568,7 +568,9 @@ function redirectionTargets(
     if (ch === "<") {
       if (segment[cursor] === "<") cursor++; // `<<<` here-string
       const isHeredoc = cursor - index >= 2;
-      if (segment[cursor] === "-" || segment[cursor] === "~") cursor++; // `<<-`, `<<~`
+      // The `-`/`~` modifiers exist ONLY on heredoc operators — a plain
+      // `< -notes.tsv` target must keep its leading `-` verbatim (X3).
+      if (isHeredoc && (segment[cursor] === "-" || segment[cursor] === "~")) cursor++;
       if (isHeredoc) {
         index = cursor - 1; // skip operator; delimiter word is data, not a path
         continue;
@@ -582,19 +584,8 @@ function redirectionTargets(
       cursor++;
       write = true;
     }
-    if (segment[cursor] === "&") {
-      // `n>&word` / `n<&word`: an fd duplication only when word is a digit
-      // or `-`; anything else is bash's `>&file` combined-stdout write.
-      const dupEnd = cursor + 1;
-      let wordEnd = dupEnd;
-      while (wordEnd < segment.length && /\d/.test(segment[wordEnd])) wordEnd++;
-      if (wordEnd > dupEnd || segment[dupEnd] === "-") {
-        index = wordEnd > dupEnd ? wordEnd - 1 : dupEnd; // skip fd word
-        continue;
-      }
-      cursor++; // `>&file` / `<&file` — treat as a file target
-      write = true; // conservative: even a weird <&file counts as a write
-    }
+    const dupMarker = segment[cursor] === "&";
+    if (dupMarker) cursor++;
     while (/\s/.test(segment[cursor] ?? "")) cursor++;
 
     const start = cursor;
@@ -612,9 +603,21 @@ function redirectionTargets(
       }
     }
     const target = segment.slice(start, cursor);
+    if (dupMarker) {
+      // `n>&word` / `n<&word`: an fd duplication only when the WHOLE word is
+      // digits or a lone `-`; anything else (`>&2026.log`, `>&file`) is
+      // bash's combined-stdout file write (X1).
+      if (target === "-" || /^\d+$/.test(target)) {
+        index = cursor - 1;
+        continue;
+      }
+      write = true; // `>&file`; a weird <&file conservatively counts too
+    }
     if (target) targets.push({ raw: target, write });
     else incomplete = true;
     index = cursor - 1;
+
+
   }
   return { targets, incomplete };
 }
@@ -703,6 +706,34 @@ function pathArg(rawToken: string | undefined): PathArg {
   return { value, literal };
 }
 
+/** Remove heredoc bodies so their literal text never becomes commands or
+ *  file targets (X4).  Returns the command with each heredoc's body lines —
+ *  and its terminating delimiter — dropped; everything after the body
+ *  (other lines, or the tail of the operator line) is untouched. */
+function stripHeredocBodies(command: string): string {
+  const lines = command.split("\n");
+  const out: string[] = [];
+  const delimiters: { word: string; dash: boolean }[] = [];
+  for (const line of lines) {
+    if (delimiters.length > 0) {
+      const current = delimiters[0];
+      const candidate = current.dash ? line.replace(/^\t+/, "") : line;
+      if (candidate === current.word) delimiters.shift();
+      continue; // body line (or the closing delimiter) — never a command
+    }
+    out.push(line);
+    // Parse this line's `<<` operators left to right; each one's delimiter
+    // ends the body that starts on the NEXT line.
+    for (const match of line.matchAll(/<<(-?)(?:"([^"]*)"|'([^']*)'|(\S+))/g)) {
+      delimiters.push({
+        word: match[2] ?? match[3] ?? match[4] ?? "",
+        dash: match[1] === "-",
+      });
+    }
+  }
+  return out.join("\n");
+}
+
 /** Split at ;, &&, ||, newline, bare & and parens — but NOT single `|`
  *  (pipes stay inside a group so adjacent stages keep their fetcher→shell
  *  adjacency).  Quote- and escape-aware, same as splitShellCommands. */
@@ -731,6 +762,7 @@ function commandGroups(command: string): string[] {
       // redirection syntax — not command separators.
       if (command[i - 1] === ">" || command[i - 1] === "<") continue;
       if (command[i + 1] === ">") continue;
+      if (command[i - 1] === "|") continue; // `|&` stderr pipe — same group (X2)
       const segment = command.slice(start, i).trim();
       if (segment) result.push(segment);
       if (command[i + 1] === "&") i++;
@@ -1068,7 +1100,7 @@ function stagePathArgs(
     // heredoc's delimiter word (the token after `<<`/`<<-`/`<<<`) is data,
     // not a path (V1/V2).
     if (/^\d*[<>]/.test(arg)) {
-      const heredocOp = /^\d*<<[-~]?$/.test(arg);
+      const heredocOp = /^\d*<{2,3}[-~]?$/.test(arg);
       i += heredocOp ? 2 : 1;
       continue;
     }
@@ -1093,7 +1125,10 @@ function stageFileOptionTargets(
     const arg = unquoteToken(rawArgs[i]);
     if (arg === "--") break;
     if (!arg.startsWith("-")) { i++; continue; }
-    if (arg.includes("=")) {
+    // `=` splits only LONG options: `--output=x` names a value.  Inside a
+    // short cluster `-oreport=1.tsv` the `=` is an ordinary filename
+    // character — it must reach the cluster scan intact (X1).
+    if (arg.startsWith("--") && arg.includes("=")) {
       const eq = arg.indexOf("=");
       if (fileOpts?.has(arg.slice(0, eq))) {
         targets.push({ value: arg.slice(eq + 1), literal: false });
@@ -1266,7 +1301,7 @@ export function commandFileTargets(
   let cwdKnown = true;
 
   const pending: { text: string; cwd: string; cwdKnown: boolean }[] = [
-    { text: normalize(command), cwd, cwdKnown: true },
+    { text: normalize(stripHeredocBodies(command)), cwd, cwdKnown: true },
   ];
   while (pending.length > 0) {
     const entry = pending.pop()!;
@@ -1662,7 +1697,7 @@ export function normalize(cmd: string): string {
  */
 export function analyzeCommand(cmd: string): DangerAnalysis {
   const behaviorSet = new Set<string>();
-  const pending = [String(cmd ?? "")];
+  const pending = [stripHeredocBodies(String(cmd ?? ""))];
 
   while (pending.length > 0) {
     const command = normalize(pending.pop() ?? "");
@@ -1882,7 +1917,7 @@ export function analyzeBashOperation(
   let currentCwd = cwd;
   let cwdKnown = true;
   const pending: { text: string; cwd: string; cwdKnown: boolean }[] = [
-    { text: normalize(command), cwd, cwdKnown: true },
+    { text: normalize(stripHeredocBodies(command)), cwd, cwdKnown: true },
   ];
   while (pending.length > 0) {
     const entry = pending.pop()!;
