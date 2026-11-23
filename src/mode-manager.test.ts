@@ -9,6 +9,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { ConfigStore } from "./config.ts";
+import { analyzeCommand, configureAutoAllow } from "./behaviors.ts";
 import { ModeManager, type CoverageSummary } from "./mode-manager.ts";
 import type { LoggerLike } from "./logger.ts";
 
@@ -96,4 +97,32 @@ test("legacy coverage.hub config is ignored without breaking configuration", () 
   const store = new ConfigStore(silentLogger, dir);
   assert.deepEqual(store.config.coverage, { eval: false });
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("autoAllowBehaviors parses string arrays and applies to the analyzer", () => {
+  const dir = tempDir();
+  fs.writeFileSync(
+    path.join(dir, "smart-approve.json"),
+    JSON.stringify({ autoAllowBehaviors: ["git-rebase", 42, null, "git-commit-amend"] }),
+    "utf-8",
+  );
+  try {
+    const store = new ConfigStore(silentLogger, dir);
+    assert.deepEqual(store.config.autoAllowBehaviors, ["git-rebase", "git-commit-amend"]);
+    assert.deepEqual(analyzeCommand("git rebase main").behaviors, []);
+    assert.deepEqual(analyzeCommand("git reset --hard HEAD~1").behaviors, ["git-hard-reset"]);
+  } finally {
+    configureAutoAllow([]);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("autoAllowBehaviors defaults to empty when missing or malformed", () => {
+  for (const user of [{}, { autoAllowBehaviors: "git-rebase" }, { autoAllowBehaviors: 7 }]) {
+    const dir = tempDir();
+    fs.writeFileSync(path.join(dir, "smart-approve.json"), JSON.stringify(user), "utf-8");
+    const store = new ConfigStore(silentLogger, dir);
+    assert.deepEqual(store.config.autoAllowBehaviors, []);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

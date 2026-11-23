@@ -18,6 +18,7 @@ function makeConfig(overrides: Partial<SmartApproveConfig> = {}): SmartApproveCo
     analysisTimeoutMs: 30_000,
     rpcIdleTimeoutMs: 600_000,
     model: "@tiny",
+    autoAllowBehaviors: [],
     ...overrides,
   };
 }
