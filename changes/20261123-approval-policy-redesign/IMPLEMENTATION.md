@@ -343,3 +343,25 @@ $ bun run build       # dist/index.js 220.54 KB
 ```
 
 **偏差**：无。
+
+## 十七、复审修正 R11（对应 REVIEW.md「第十一轮终审 · 7fd71f7」Q1-终/N1）
+
+复审对象：`7fd71f7`。Q2/Q3 已关闭；本轮 Q1-终 必修 + N1（非阻断）交付。
+
+| 项 | 修正 | 断言 |
+|----|------|------|
+| Q1-终（替换体 cwd 作用域） | `stripHeredocBodies` 改为在 heredoc 声明行**之前**发射 `__SA_HEREDOC_SUB__<id>` 标记行，替换体文本按 id 存入 `substitutionBodies`；三个 walker 遇标记即把替换体作为独立 pending 单元、携带**声明时点 cwd** 分析——替换体内部的 `cd` 只作用于该单元（子 shell 作用域），声明行后续的父命令 `cd` 不会回溯影响正文替换；目录未知时经 `cwdKnown` 传播 undeterminable | `heredoc substitutions are independent units at declaration-time cwd (Q1-final)` 三组对照：① `$(cd sub; cat note)` + 正文后 `cat later` → `sub/note` 与 `later`（cd 不泄漏）；② `cat <<EOF; cd sub; cat later` 正文 `$(cat note)` → `note`（声明 cwd）与 `sub/later`；③ 先 `cd sub` 再声明 heredoc 的既有用例保持 |
+| N1（空引用分隔词） | 分隔词捕获区分"没有读到词"与"读到值为空的引用词"：`<<''` 是值为空的真实分隔词，正文以空行结束、保持字面不展开，后续真实命令照常分析 | `empty quoted delimiter ends at an empty line, body stays literal (N1)`：`<<''` 正文中的 `$(rm -rf …)` 不产生目标/行为、空行后的 `sort after.tsv` 计入且非 undeterminable |
+
+**复审修正 R11 后验证**：
+
+```
+$ bun run typecheck   # tsc --noEmit → clean
+$ bun test src
+ 272 pass
+ 0 fail
+Ran 272 tests across 14 files.
+$ bun run build       # dist/index.js 221.59 KB
+```
+
+**偏差**：无。
