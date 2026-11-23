@@ -201,3 +201,28 @@ $ bun run build       # dist/index.js 213.61 KB
 ```
 
 **偏差**：无。
+
+## 十一、复审修正 R5（对应 REVIEW.md「第五轮终审 · f2c3771」V1–V5）
+
+复审对象：`f2c3771`。W1/W4 已关闭；本轮 V1–V4 必修 + V5 建议项一并交付。
+
+| 项 | 修正 | 断言 |
+|----|------|------|
+| V1（重定向/连写选项合并） | `redirectionTargets` 按操作数区分：`>&word`/`<&word` 仅当 word 为数字或 `-` 时是 fd 复制（无文件目标），`>&file` 按 bash 语义为写文件目标；`&>`/`&>>` 在 `commandGroups`/`splitCommandSegments` 中不再被当作命令分隔符；`>|`（noclobber 覆盖）与 `|&`（stderr 管道）在管道/分段逻辑中正确处理；`SHORT_FLAGS.sort` 表 + 逐字符 cluster 扫描（`-roout` = `-r` + `-oout`），未知 cluster 字符 → undeterminable；`stagePathArgs` 跳过 heredoc 操作符后的 delimiter 词 | `redirect operator forms: >&file vs >&N, &>, and option clusters (V1)`：`>&out.log` 计入目标、`>&2`/`2>&1`/`2>&-` 无目标、`make &>build.log` 单命令单目标、`sort -roout.tsv` 与 `-o out.tsv` 目标集相同、`sort -rx` undeterminable、`sort -rn` 正常 |
+| V2（读写语义） | `redirectionTargets` 返回 `{raw, write}`：`<` 为读，`>`/`>>`/`&>`/`<>` 为写；域检查消费全部目标（真实读目标同样参与域校验），`write-sensitive-file` 循环只消费写目标；heredoc/here-string（`<<`/`<<-`/`<<<`）的 delimiter 词不是文件目标 | `redirect read/write semantics…(V2)`：`cat < /proc/uptime` 不触发 write-sensitive-file、`echo 1 > /proc/sysrq-trigger` 仍触发、fd 复制无目标、heredoc 的 delimiter/正文均非目标 |
+| V3（域根展开失败） | `allTargetsWithinDomain`：`expandHomeLiteral` 返回空/undefined（空串、动态 `$VAR`、`~user`）时直接 return false → 普通审批，不再把空串交共享解析器当 cwd；`semanticPathCandidates` 空候选同样拒绝 | `unresolvable domain roots grant nothing, even from the entry cwd (V3)`：`""`/`$SOME_UNSET_VAR`/`~definitely-no-such-user-xyz` 三种域根即使从条目 cwd 调用也不授予；有效 `~` 域仍可匹配 |
+| V4（~ 前缀保留分量） | `expandHomeLiteral`、`resolveFilesystemPathCandidates`、`semanticPathCandidates` 三处 `~/` 展开由 `path.join(home, rest)` 改为前缀替换（`home + rest`）——`..` 分量保留给逐分量 realpath 遍历，域根、文件工具目标、保护匹配统一 | `home-prefixed targets keep original components through symlinked dirs (V4)`：绝对、`~/`、相对三种表示对 `l/../note`（l→/etc）同判域外拒绝；真实域内文件三种表示均放行（测试构造用字符串切片而非 `path.relative`，后者会先行折叠 `..`） |
+| V5（混合转义，建议项） | `pathArg`：前导转义仅覆盖一个字符——值余部仍含未转义 `$`/反引号时不冻结为字面量，回到 `expandHomeLiteral` → undeterminable | `mixed escape + dynamic remainder is undeterminable, not frozen (V5)`：`>\~$VAR` 为 undeterminable、`>\~file` 仍为字面量目标 |
+
+**复审修正 R5 后验证**：
+
+```
+$ bun run typecheck   # tsc --noEmit → clean
+$ bun test src
+ 252 pass
+ 0 fail
+Ran 252 tests across 14 files.
+$ bun run build       # dist/index.js 215.68 KB
+```
+
+**偏差**：无。
