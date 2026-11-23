@@ -1303,3 +1303,53 @@ test("empty quoted delimiter ends at an empty line, body stays literal (N1)", ()
   assert.ok(!behavior.behaviors.includes("recursive-force-delete"),
     "empty quoted delimiter body is literal data");
 });
+
+test("heredoc expansions bind to the owning segment's cwd, each independent (R1)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smart-approve-r1-"));
+  const sub = path.join(dir, "sub");
+  const map = (r: { targets: { value: string; cwd: string }[] }) =>
+    r.targets.map((t) => `${t.cwd}|${t.value}`);
+  try {
+    fs.mkdirSync(sub);
+    // ① cd inside a substitution stays in that substitution.
+    const a = map(commandFileTargets("cat <<EOF\n$(cd sub; cat note)\nEOF\ncat later\n", dir));
+    assert.ok(a.includes(`${sub}|note`), `① sub/note in ${a}`);
+    assert.ok(a.includes(`${dir}|later`), `① later in ${a}`);
+    // ② cd later on the declaration line can't reach into the body.
+    const b = map(commandFileTargets("cat <<EOF; cd sub; cat later\n$(cat note)\nEOF\n", dir));
+    assert.ok(b.includes(`${dir}|note`), `② note in ${b}`);
+    assert.ok(b.includes(`${sub}|later`), `② sub/later in ${b}`);
+    // ③ cd before the declaration applies.
+    const c = commandFileTargets("cd sub\ncat <<EOF\n$(cat f)\nEOF\n", dir);
+    assert.ok(c.targets.some((t) => t.cwd === sub && t.value === "f"), "③ sub/f");
+    // ④ cd && heredoc on ONE line: the expansion belongs to the cat
+    // segment, whose cwd is AFTER the cd.
+    const d = map(commandFileTargets("cd sub && cat <<EOF\n$(cat note)\nEOF\n", dir));
+    assert.ok(d.includes(`${sub}|note`), `④ sub/note in ${d}`);
+    // ⑤ Two substitutions in one body: independent cwd state.
+    const e = map(commandFileTargets(
+      "cat <<EOF\n$(cd sub; cat note)\n$(cat later)\nEOF\n",
+      dir,
+    ));
+    assert.ok(e.includes(`${sub}|note`), `⑤ sub/note in ${e}`);
+    assert.ok(e.includes(`${dir}|later`), `⑤ later (not sub/later) in ${e}`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("unknown cwd makes relative targets undeterminable (R2)", () => {
+  const r = commandFileTargets('cd "$SUB"; cat note', "/tmp");
+  assert.equal(r.undeterminable, true, "unknown cwd must not produce a definite target");
+  assert.deepEqual(r.targets, [], "no stale-cwd target registration");
+});
+
+test("a trailing newline is not a blank line for heredoc termination (N1)", () => {
+  // `cat <<''\nbody\n` has NO real blank line — bash warns missing delimiter.
+  const open = commandFileTargets("cat <<''\nbody\n", "/tmp");
+  assert.equal(open.undeterminable, true, "no blank line → unterminated");
+  // A real blank line closes it; the following command is analyzed.
+  const closed = commandFileTargets("cat <<''\nbody\n\nsort after.tsv\n", "/tmp");
+  assert.equal(closed.undeterminable, false);
+  assert.deepEqual(closed.targets.map((t) => t.value), ["after.tsv"]);
+});

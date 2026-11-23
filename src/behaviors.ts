@@ -776,43 +776,53 @@ function findHeredocSubstitutions(body: string): string[] {
   return result;
 }
 
-/** Marker line emitted before a heredoc declaration line; the walkers turn
- *  it into an INDEPENDENT analysis unit carrying the cwd in effect at the
- *  declaration point (Q1). */
-const HEREDOC_SUB_MARK = "__SA_HEREDOC_SUB__";
-
-/** Remove heredoc bodies so their literal text never becomes commands or
- *  file targets (X4/Z1).  Unquoted bodies execute their command
- *  substitutions; those are returned as `substitutionBodies[id]` with a
- *  `__SA_HEREDOC_SUB__<id>` marker line placed BEFORE the declaration line,
- *  so each substitution is analyzed as its own unit with the cwd at the
- *  declaration point — its internal `cd` can't leak into the parent, and a
- *  `cd` later on the declaration line can't reach backwards into it (Q1).
- *  Quoted-delimiter bodies are pure data and vanish.  `unterminated` marks
- *  a heredoc whose closing delimiter never appeared. */
-function stripHeredocBodies(command: string): {
+/** One command line of heredoc-preprocessed work.  `expansions` attaches
+ *  each unquoted heredoc body's command substitutions to the GROUP INDEX of
+ *  the segment that owns the redirection — the walker analyzes each
+ *  substitution as an independent unit with the cwd in effect at that
+ *  segment's start (R1), never as text spliced into the parent stream.
+ *  Typed records, not marker text (R3). */
+interface HeredocWorkItem {
   text: string;
-  substitutionBodies: string[];
+  expansions: { group: number; bodies: string[] }[];
+}
+
+interface HeredocWork {
+  items: HeredocWorkItem[];
   unterminated: boolean;
-} {
+}
+
+/** Split a command into per-line work items with heredoc bodies removed.
+ *  Unquoted bodies expand `$VAR`/`$(cmd)`/backticks in bash; each
+ *  substitution becomes its own expansion body bound to the owning
+ *  segment's group index.  Quoted bodies are data and vanish.  An
+ *  unterminated heredoc sets `unterminated` (Q2).  A trailing empty
+ *  fragment from `split("\n")` is NOT a real blank line (N1). */
+function splitHeredocWork(command: string): HeredocWork {
   const lines = command.split("\n");
-  const out: string[] = [];
-  const delimiters: { id: number; word: string; dash: boolean; quoted: boolean }[] = [];
+  if (lines.length > 1 && lines[lines.length - 1] === "") lines.pop();
+  const items: HeredocWorkItem[] = [];
+  const delimiters: {
+    id: number; word: string; dash: boolean; quoted: boolean;
+    item: number; group: number;
+  }[] = [];
   const bodies: string[] = [];
-  const substitutionBodies: string[] = [];
+  const expansions: { item: number; group: number; bodies: string[] }[] = [];
   let quote: string | undefined; // carried across lines (multi-line strings)
   let nextId = 0;
 
+  const finishBody = (id: number, item: number, group: number, quoted: boolean): void => {
+    if (quoted) return;
+    const subs = findHeredocSubstitutions(bodies[id] ?? "");
+    if (subs.length > 0) expansions.push({ item, group, bodies: subs });
+  };
+
   for (const line of lines) {
     if (delimiters.length > 0) {
-      // Each queued delimiter carries its OWN id/dash/quoted attributes (Q3).
       const current = delimiters[0];
       const candidate = current.dash ? line.replace(/^\t+/, "") : line;
       if (candidate === current.word) {
-        if (!current.quoted) {
-          substitutionBodies[current.id] =
-            findHeredocSubstitutions(bodies[current.id] ?? "").join("\n");
-        }
+        finishBody(current.id, current.item, current.group, current.quoted);
         delimiters.shift();
       } else {
         bodies[current.id] = (bodies[current.id] ? `${bodies[current.id]}\n` : "") + line;
@@ -820,9 +830,14 @@ function stripHeredocBodies(command: string): {
       continue; // body line (or the closing delimiter) — never a command
     }
 
-    // Recognize redirections only at real shell syntax positions (Z1) —
-    // markers are collected first and emitted BEFORE the declaration line.
-    const markers: string[] = [];
+    const itemIndex = items.length;
+    const item: HeredocWorkItem = { text: line, expansions: [] };
+    items.push(item);
+    let groupIndex = 0;
+
+    // Recognize redirections only at real shell syntax positions (Z1) and
+    // track the command-group index so an expansion binds to the segment
+    // that OWNS the redirection, not the start of the line (R1).
     for (let i = 0; i < line.length; i++) {
       const c = line[i];
       if (quote === "'") {
@@ -837,6 +852,17 @@ function stripHeredocBodies(command: string): {
       if (c === "\\") { i++; continue; }
       if (c === "'" || c === "\"") { quote = c; continue; }
       if (c === "#" && (i === 0 || /[\s;|&(]/.test(line[i - 1]))) break; // comment
+      // Mirror commandGroups' separators for the group index.
+      if (c === ";" || c === "(" || c === ")") { groupIndex++; continue; }
+      if (c === "&") {
+        if (line[i - 1] === ">" || line[i - 1] === "<") continue; // fd dup
+        if (line[i + 1] === ">") continue; // &>
+        if (line[i - 1] === "|") continue; // |&
+        if (line[i + 1] === "&") i++;
+        groupIndex++;
+        continue;
+      }
+      if (c === "|" && line[i + 1] === "|") { groupIndex++; i++; continue; }
       if (c !== "<" || line[i + 1] !== "<") continue;
       if (line[i + 2] === "<") { i += 2; continue; } // here-string — no body
 
@@ -868,23 +894,18 @@ function stripHeredocBodies(command: string): {
       // value is "" (body ends at an empty line) — distinct from no word.
       if (j === wordStart) continue;
       const word = evaluateShellWord(line.slice(wordStart, j));
-      const id = nextId++;
-      delimiters.push({ id, word, dash, quoted });
-      bodies[id] = "";
-      if (!quoted) markers.push(`${HEREDOC_SUB_MARK}${id}`);
+      delimiters.push({ id: nextId++, word, dash, quoted, item: itemIndex, group: groupIndex });
+      bodies[nextId - 1] = "";
       i = j - 1;
     }
-    out.push(...markers, line);
   }
   // A body left open at EOF has no provable boundary — still surface its
   // substitutions for analysis, but mark the command undeterminable (Q2).
   const unterminated = delimiters.length > 0;
-  for (const d of delimiters) {
-    if (!d.quoted) {
-      substitutionBodies[d.id] = findHeredocSubstitutions(bodies[d.id] ?? "").join("\n");
-    }
-  }
-  return { text: out.join("\n"), substitutionBodies, unterminated };
+  for (const d of delimiters) finishBody(d.id, d.item, d.group, d.quoted);
+
+  for (const exp of expansions) items[exp.item]?.expansions.push({ group: exp.group, bodies: exp.bodies });
+  return { items, unterminated };
 }
 
 /** Split at ;, &&, ||, newline, bare & and parens — but NOT single `|`
@@ -1454,31 +1475,33 @@ export function commandFileTargets(
   let currentCwd = cwd;
   let cwdKnown = true;
 
-  const stripped = stripHeredocBodies(command);
   const pending: { text: string; cwd: string; cwdKnown: boolean }[] = [
-    { text: normalize(stripped.text), cwd, cwdKnown: true },
+    { text: command, cwd, cwdKnown: true },
   ];
-  // Unquoted heredoc substitutions are inlined at their stream position in
-  // stripped.text (Q1); an unterminated body is undeterminable (Q2).
-  const heredocUndeterminable = stripped.unterminated;
   while (pending.length > 0) {
     const entry = pending.pop()!;
     currentCwd = entry.cwd;
     cwdKnown = entry.cwdKnown;
-    const substitutions = findShellSubstitutions(entry.text);
+    // Typed heredoc work records (R3): each unquoted body's substitutions
+    // bind to their owning segment's group index and become independent
+    // units with the cwd in effect there (R1).
+    const work = splitHeredocWork(entry.text);
+    if (work.unterminated) undeterminable = true; // Q2
+    for (const item of work.items) {
+    const substitutions = findShellSubstitutions(item.text);
     for (const substitution of substitutions) {
       undeterminable = true; // executed payload we can't statically scope
       pending.push({ text: substitution.body, cwd: currentCwd, cwdKnown });
     }
-    const executableCommand = stripShellSubstitutions(entry.text, substitutions);
-    for (const group of commandGroups(executableCommand)) {
-      // Q1: a heredoc-substitution marker starts an independent unit whose
-      // cwd is the declaration point — its cd's stay inside the unit.
-      if (group.trim().startsWith(HEREDOC_SUB_MARK)) {
-        const id = Number(group.trim().slice(HEREDOC_SUB_MARK.length));
-        const body = stripped.substitutionBodies[id];
-        if (body) pending.push({ text: body, cwd: currentCwd, cwdKnown });
-        continue;
+    const executableCommand = stripShellSubstitutions(item.text, substitutions);
+    const groups = commandGroups(executableCommand);
+    for (let gi = 0; gi < groups.length; gi++) {
+      const group = groups[gi];
+      for (const exp of item.expansions) {
+        if (exp.group !== gi) continue;
+        for (const body of exp.bodies) {
+          pending.push({ text: body, cwd: currentCwd, cwdKnown });
+        }
       }
       const stages = pipeStages(group);
       for (const stage of stages) {
@@ -1527,6 +1550,7 @@ export function commandFileTargets(
             undeterminable = true;
             continue;
           }
+          if (!cwdKnown) { undeterminable = true; continue; } // R2
           targets.push({ value: expanded, cwd: currentCwd });
         }
 
@@ -1541,9 +1565,13 @@ export function commandFileTargets(
             continue;
           }
           if (expanded === "/dev/null") continue;
+          // R2: with an unknown cwd a relative target must NOT be resolved
+          // against a stale currentCwd — undeterminable → normal approval.
+          if (!cwdKnown) { undeterminable = true; continue; }
           targets.push({ value: expanded, cwd: currentCwd });
         }
       }
+    }
     }
   }
   const seen = new Set<string>();
@@ -1553,7 +1581,7 @@ export function commandFileTargets(
     seen.add(key);
     return true;
   });
-  return { targets: unique, undeterminable: undeterminable || heredocUndeterminable };
+  return { targets: unique, undeterminable };
 }
 
 
@@ -1863,8 +1891,12 @@ export function normalize(cmd: string): string {
  */
 export function analyzeCommand(cmd: string): DangerAnalysis {
   const behaviorSet = new Set<string>();
-  const stripped = stripHeredocBodies(String(cmd ?? ""));
-  const pending = [stripped.text, ...stripped.substitutionBodies.filter(Boolean)];
+  const work = splitHeredocWork(String(cmd ?? ""));
+  const pending: string[] = [];
+  for (const item of work.items) {
+    pending.push(item.text);
+    for (const exp of item.expansions) pending.push(...exp.bodies);
+  }
 
   while (pending.length > 0) {
     const command = normalize(pending.pop() ?? "");
@@ -1875,7 +1907,6 @@ export function analyzeCommand(cmd: string): DangerAnalysis {
     const syntax = stripQuotedShellData(executableCommand);
 
     for (const group of commandGroups(executableCommand)) {
-      if (group.trim().startsWith(HEREDOC_SUB_MARK)) continue; // analyzed separately
       const stages = pipeStages(group);
 
       // remote-fetch-exec is judged on truly ADJACENT pairs (R1): a
@@ -2045,7 +2076,7 @@ export function analyzeCommand(cmd: string): DangerAnalysis {
 
   // Q2: an unterminated heredoc body has no provable boundary — surface the
   // uncertainty to the gate instead of returning a clean-looking verdict.
-  const requiresConfirmation = stripped.unterminated || undefined;
+  const requiresConfirmation = work.unterminated || undefined;
   return { behaviors, labels, hardBlocked, denyTier, requiresConfirmation };
 }
 
@@ -2087,25 +2118,30 @@ export function analyzeBashOperation(
   const behaviorSet = new Set(analysis.behaviors);
   let currentCwd = cwd;
   let cwdKnown = true;
-  const stripped = stripHeredocBodies(command);
   const pending: { text: string; cwd: string; cwdKnown: boolean }[] = [
-    { text: normalize(stripped.text), cwd, cwdKnown: true },
+    { text: command, cwd, cwdKnown: true },
   ];
+  let heredocUnterminated = false;
   while (pending.length > 0) {
     const entry = pending.pop()!;
     currentCwd = entry.cwd;
     cwdKnown = entry.cwdKnown;
-    const substitutions = findShellSubstitutions(entry.text);
+    const work = splitHeredocWork(entry.text);
+    if (work.unterminated) heredocUnterminated = true;
+    for (const item of work.items) {
+    const substitutions = findShellSubstitutions(item.text);
     for (const substitution of substitutions) {
       pending.push({ text: substitution.body, cwd: currentCwd, cwdKnown });
     }
-    const executableCommand = stripShellSubstitutions(entry.text, substitutions);
-    for (const group of commandGroups(executableCommand)) {
-      if (group.trim().startsWith(HEREDOC_SUB_MARK)) {
-        const id = Number(group.trim().slice(HEREDOC_SUB_MARK.length));
-        const body = stripped.substitutionBodies[id];
-        if (body) pending.push({ text: body, cwd: currentCwd, cwdKnown });
-        continue;
+    const executableCommand = stripShellSubstitutions(item.text, substitutions);
+    const groups = commandGroups(executableCommand);
+    for (let gi = 0; gi < groups.length; gi++) {
+      const group = groups[gi];
+      for (const exp of item.expansions) {
+        if (exp.group !== gi) continue;
+        for (const body of exp.bodies) {
+          pending.push({ text: body, cwd: currentCwd, cwdKnown });
+        }
       }
       for (const stage of pipeStages(group)) {
         const invocation = commandAndArgs(stage);
@@ -2174,6 +2210,7 @@ export function analyzeBashOperation(
         }
       }
     }
+    }
   }
 
   if (isSensitiveWorkingDirectory(cwd, sessionCwd)) {
@@ -2187,7 +2224,7 @@ export function analyzeBashOperation(
     !hardBlocked && behaviors.some((behavior) => behavior in DENY_TIER_BEHAVIORS);
   const requiresConfirmation =
     (analysis.requiresConfirmation ?? false) ||
-    stripped.unterminated || // Q2: unprovable heredoc body boundary
+    heredocUnterminated || // Q2: unprovable heredoc body boundary
     (!hasUI && behaviorSet.has("shutdown-reboot"));
 
   return { behaviors, labels, hardBlocked, denyTier, requiresConfirmation };
