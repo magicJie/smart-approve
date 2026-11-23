@@ -1504,3 +1504,35 @@ test("unquoted bodies fold continuations before the delimiter check (K2)", () =>
   assert.deepEqual(quoted.targets.map((t) => t.value), ["after"]);
   assert.equal(quoted.undeterminable, false);
 });
+
+test("joined logical body lines are compared against the delimiter (M1)", () => {
+  // `\`+EOF joins to exactly EOF → the body CLOSES; `after` is a command.
+  const joined = commandFileTargets(
+    "cat <<EOF\n\\\nEOF\ncat after\n",
+    "/tmp",
+  );
+  assert.deepEqual(joined.targets.map((t) => t.value), ["after"]);
+  assert.equal(joined.undeterminable, false, "joined EOF must close the body");
+  // `abc\`+EOF joins to abcEOF ≠ EOF → body continues; unterminated here.
+  const notClosed = commandFileTargets(
+    "cat <<EOF\nabc\\\nEOF\ncat after\n",
+    "/tmp",
+  );
+  assert.equal(notClosed.undeterminable, true);
+  assert.deepEqual(notClosed.targets, []);
+  // Even backslashes: `\\` is a literal backslash, no joining — the next
+  // standalone EOF closes immediately.
+  const even = commandFileTargets(
+    "cat <<EOF\nabc\\\\\nEOF\ncat after\n",
+    "/tmp",
+  );
+  assert.deepEqual(even.targets.map((t) => t.value), ["after"]);
+  assert.equal(even.undeterminable, false);
+  // Quoted bodies never join: `\`+EOF closes at that EOF.
+  const quoted = commandFileTargets(
+    "cat <<'EOF'\n\\\nEOF\ncat after\n",
+    "/tmp",
+  );
+  assert.deepEqual(quoted.targets.map((t) => t.value), ["after"]);
+  assert.equal(quoted.undeterminable, false);
+});

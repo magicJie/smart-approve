@@ -874,7 +874,7 @@ function splitHeredocWork(command: string): HeredocWork {
   // continued declaration line keeps consuming command text (its operands
   // belong to the declaration, not the body).
   const pendingDeclarations: typeof delimiters = [];
-  let bodyContinued = false; // K2: previous unquoted body line ended in `\`
+  let pendingBodyLine = ""; // K2/M1: unquoted logical body line being joined
 
   const finishBody = (id: number, item: number, group: number, quoted: boolean): void => {
     if (quoted) return;
@@ -885,21 +885,26 @@ function splitHeredocWork(command: string): HeredocWork {
   for (const line of lines) {
     if (delimiters.length > 0) {
       const current = delimiters[0];
-      // K2: in an UNQUOTED body a trailing backslash joins the next line
-      // into the same logical body line — a delimiter on that next line is
-      // body text, not a closing word.  Quoted bodies compare verbatim.
-      if (!bodyContinued) {
-        const candidate = current.dash ? line.replace(/^\t+/, "") : line;
-        if (candidate === current.word) {
-          finishBody(current.id, current.item, current.group, current.quoted);
-          delimiters.shift();
-          bodyContinued = false;
-          currentItem = undefined;
-          continue;
-        }
+      // M1: in an UNQUOTED body, continuation lines are JOINED first and the
+      // completed LOGICAL line is compared with the delimiter — `abc\`+EOF
+      // (→abcEOF) stays body, but `\`+EOF (→EOF) closes.  Quoted bodies
+      // compare physical lines verbatim.
+      const logicalLine = current.quoted ? line : pendingBodyLine + line;
+      const continued = !current.quoted && /(?:^|[^\\])(?:\\\\)*\\$/.test(line);
+      if (continued) {
+        pendingBodyLine = logicalLine.slice(0, -1); // drop the continuation `\`
+        currentItem = undefined;
+        continue;
       }
-      bodies[current.id] = (bodies[current.id] ? `${bodies[current.id]}\n` : "") + line;
-      bodyContinued = !current.quoted && /(?:^|[^\\])(?:\\\\)*\\$/.test(line);
+      pendingBodyLine = "";
+      const candidate = current.dash ? logicalLine.replace(/^\t+/, "") : logicalLine;
+      if (candidate === current.word) {
+        finishBody(current.id, current.item, current.group, current.quoted);
+        delimiters.shift();
+        currentItem = undefined;
+        continue;
+      }
+      bodies[current.id] = (bodies[current.id] ? `${bodies[current.id]}\n` : "") + logicalLine;
       currentItem = undefined; // the next real line starts a new command
       continue; // body line (or the closing delimiter) — never a command
     }
