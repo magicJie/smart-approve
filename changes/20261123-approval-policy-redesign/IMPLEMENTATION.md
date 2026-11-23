@@ -226,3 +226,28 @@ $ bun run build       # dist/index.js 215.68 KB
 ```
 
 **偏差**：无。
+
+## 十二、复审修正 R6（对应 REVIEW.md「第六轮终审 · 5a1b18b」X1–X5）
+
+复审对象：`5a1b18b`。V3/V4 已关闭；本轮 X1–X4 必修 + X5（V5 残留）交付。
+
+| 项 | 修正 | 断言 |
+|----|------|------|
+| X1（fd vs 文件名按完整操作数） | `redirectionTargets`：`>&word`/`<&word` 仅当整个 word 为纯数字或单独 `-` 时是 fd 复制——`>&2026.log`/`2>&2026.log` 是写文件；`=` 分支限定 `--` 长选项（`--output=x`），短 cluster 中 `-oreport=1.tsv` 的 `=` 作为文件名字符进入 cluster 扫描 | `fd duplication is decided on the whole word, not the first char (X1)`：`>&2026.log`/`2>&2026.log` 计入目标、`>&2`/`2>&1` 无目标、`sort -oreport=1.tsv` 解析出 `report=1.tsv` |
+| X2（`\|&` 管线相邻） | `commandGroups` 在 `&` 前为 `\|` 时不再截断——`\|&` 作为完整管道操作符与 `\|` 走同一分组，`pipeStages` 中 `\|&` 已正确跳过分隔 | `\|& is a real two-stage pipe for adjacency classification (X2)`：`printf a \|& wc -c` 与 `printf a \| wc -c` 同级分组、`printf a \|& sh` 与 `printf a \| sh` 硬阻断结论一致 |
+| X3（输入重定向原名） | `-`/`~` 修饰符仅在已确认为 heredoc（`<<`/`<<-`/`<<<`）后消费；普通 `<`/`>` 操作数原样保留 | `input redirection operands keep their leading characters (X3)`：`cat < -notes.tsv` 与 `cat <-notes.tsv` 均指向 `-notes.tsv` |
+| X4（字面正文不是文件/命令） | 新增 `stripHeredocBodies`：在 `analyzeCommand` 与 `commandFileTargets` 两个入口、任何分段/分类之前移除 heredoc 正文行与终止分隔词（支持引号分隔词、`<<-` 制表符剥离、同行多个 heredoc 队列）；`stagePathArgs` 的 heredoc 操作符扩展为 `<{2,3}`，here-string 实参同样跳过；正文之后的真实命令照常参与审批 | `heredoc bodies and here-strings stay data, never commands or paths (X4)`：带引号 heredoc 正文中的 `cat report.tsv` 不产生目标、正文后的 `sort real.tsv` 照常计入、`cat <<< 'meeting minutes'` 无目标、正文中的 `rm -rf /` 不产生 delete 行为 |
+| X5（V5 残留） | `\~`/`~` 与 `$HOME`/`$VAR` 同参且无法保留逐字符展开语义时，`pathArg`/`expandHomeLiteral` 路径返回 undeterminable，不输出错误绝对路径 | `tilde mixed with variable in one operand is undeterminable (X5)`：`>\~$HOME/x`、`>\~/$VAR`、`>~$VAR` 均 undeterminable（`>$HOME/x\~` 的尾转义为合法字面量，正常解析，未列入） |
+
+**复审修正 R6 后验证**：
+
+```
+$ bun run typecheck   # tsc --noEmit → clean
+$ bun test src
+ 257 pass
+ 0 fail
+Ran 257 tests across 14 files.
+$ bun run build       # dist/index.js 216.34 KB
+```
+
+**偏差**：无。
