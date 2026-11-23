@@ -776,12 +776,14 @@ function findHeredocSubstitutions(body: string): string[] {
   return result;
 }
 
-/** One command line of heredoc-preprocessed work.  `expansions` attaches
+/** One logical command of heredoc-preprocessed work.  `expansions` attaches
  *  each unquoted heredoc body's command substitutions to the GROUP INDEX of
  *  the segment that owns the redirection — the walker analyzes each
  *  substitution as an independent unit with the cwd in effect at that
- *  segment's start (R1), never as text spliced into the parent stream.
- *  Typed records, not marker text (R3). */
+ *  segment's start (R1).  Typed records, not marker text (R3).  Items are
+ *  LOGICAL commands: quote and backslash-continuation state carries across
+ *  physical lines, and an input with no heredoc at all stays ONE whole-text
+ *  item so its analysis is identical to the pre-heredoc pipeline (S2). */
 interface HeredocWorkItem {
   text: string;
   expansions: { group: number; bodies: string[] }[];
@@ -792,8 +794,8 @@ interface HeredocWork {
   unterminated: boolean;
 }
 
-/** Split a command into per-line work items with heredoc bodies removed.
- *  Unquoted bodies expand `$VAR`/`$(cmd)`/backticks in bash; each
+/** Split a command into logical-command work items with heredoc bodies
+ *  removed.  Unquoted bodies expand `$VAR`/`$(cmd)`/backticks in bash; each
  *  substitution becomes its own expansion body bound to the owning
  *  segment's group index.  Quoted bodies are data and vanish.  An
  *  unterminated heredoc sets `unterminated` (Q2).  A trailing empty
@@ -808,7 +810,11 @@ function splitHeredocWork(command: string): HeredocWork {
   }[] = [];
   const bodies: string[] = [];
   const expansions: { item: number; group: number; bodies: string[] }[] = [];
-  let quote: string | undefined; // carried across lines (multi-line strings)
+  let quote: string | undefined;
+  let currentItem: HeredocWorkItem | undefined;
+  let groupIndex = 0;
+  let segmentHasContent = false;
+  let hadHeredoc = false;
   let nextId = 0;
 
   const finishBody = (id: number, item: number, group: number, quoted: boolean): void => {
@@ -827,42 +833,57 @@ function splitHeredocWork(command: string): HeredocWork {
       } else {
         bodies[current.id] = (bodies[current.id] ? `${bodies[current.id]}\n` : "") + line;
       }
+      currentItem = undefined; // the next real line starts a new command
       continue; // body line (or the closing delimiter) — never a command
     }
 
-    const itemIndex = items.length;
-    const item: HeredocWorkItem = { text: line, expansions: [] };
-    items.push(item);
-    let groupIndex = 0;
+    if (currentItem === undefined) {
+      currentItem = { text: line, expansions: [] };
+      items.push(currentItem);
+      groupIndex = 0;
+      segmentHasContent = false;
+    } else {
+      currentItem.text += `\n${line}`; // continuation / open quote (S2)
+    }
+    const itemIndex = items.length - 1;
 
-    // Recognize redirections only at real shell syntax positions (Z1) and
-    // track the command-group index so an expansion binds to the segment
-    // that OWNS the redirection, not the start of the line (R1).
     for (let i = 0; i < line.length; i++) {
       const c = line[i];
       if (quote === "'") {
+        segmentHasContent = true;
         if (c === "'") quote = undefined;
         continue;
       }
       if (quote === "\"") {
+        segmentHasContent = true;
         if (c === "\\") { i++; continue; }
         if (c === "\"") quote = undefined;
         continue;
       }
-      if (c === "\\") { i++; continue; }
-      if (c === "'" || c === "\"") { quote = c; continue; }
+      if (c === "\\") { segmentHasContent = true; i++; continue; }
+      if (c === "'" || c === "\"") { quote = c; segmentHasContent = true; continue; }
       if (c === "#" && (i === 0 || /[\s;|&(]/.test(line[i - 1]))) break; // comment
-      // Mirror commandGroups' separators for the group index.
-      if (c === ";" || c === "(" || c === ")") { groupIndex++; continue; }
+      // Mirror commandGroups' EMISSION semantics for the group index (S1):
+      // an index advances only when a non-empty segment would be emitted —
+      // `(` with nothing before it does NOT consume a group number.
+      if (c === ";" || c === "(" || c === ")") {
+        if (segmentHasContent) { groupIndex++; segmentHasContent = false; }
+        continue;
+      }
       if (c === "&") {
         if (line[i - 1] === ">" || line[i - 1] === "<") continue; // fd dup
         if (line[i + 1] === ">") continue; // &>
         if (line[i - 1] === "|") continue; // |&
         if (line[i + 1] === "&") i++;
-        groupIndex++;
+        if (segmentHasContent) { groupIndex++; segmentHasContent = false; }
         continue;
       }
-      if (c === "|" && line[i + 1] === "|") { groupIndex++; i++; continue; }
+      if (c === "|" && line[i + 1] === "|") {
+        if (segmentHasContent) { groupIndex++; segmentHasContent = false; }
+        i++;
+        continue;
+      }
+      if (!/\s/.test(c)) segmentHasContent = true;
       if (c !== "<" || line[i + 1] !== "<") continue;
       if (line[i + 2] === "<") { i += 2; continue; } // here-string — no body
 
@@ -896,15 +917,24 @@ function splitHeredocWork(command: string): HeredocWork {
       const word = evaluateShellWord(line.slice(wordStart, j));
       delimiters.push({ id: nextId++, word, dash, quoted, item: itemIndex, group: groupIndex });
       bodies[nextId - 1] = "";
+      hadHeredoc = true;
       i = j - 1;
     }
+
+    // A logical command continues while a quote is open or the line ends in
+    // an unescaped backslash (outside single quotes).
+    if (quote === undefined) {
+      let trailing = 0;
+      for (let k = line.length - 1; k >= 0 && line[k] === "\\"; k--) trailing++;
+      if (trailing % 2 === 0) currentItem = undefined;
+    }
   }
-  // A body left open at EOF has no provable boundary — still surface its
-  // substitutions for analysis, but mark the command undeterminable (Q2).
   const unterminated = delimiters.length > 0;
   for (const d of delimiters) finishBody(d.id, d.item, d.group, d.quoted);
-
   for (const exp of expansions) items[exp.item]?.expansions.push({ group: exp.group, bodies: exp.bodies });
+
+  // S2: no heredoc anywhere → preserve the original whole-text pipeline.
+  if (!hadHeredoc) return { items: [{ text: command, expansions: [] }], unterminated: false };
   return { items, unterminated };
 }
 
@@ -1488,12 +1518,13 @@ export function commandFileTargets(
     const work = splitHeredocWork(entry.text);
     if (work.unterminated) undeterminable = true; // Q2
     for (const item of work.items) {
-    const substitutions = findShellSubstitutions(item.text);
+    const itemText = normalize(item.text); // comment stripping per logical command (S2)
+    const substitutions = findShellSubstitutions(itemText);
     for (const substitution of substitutions) {
       undeterminable = true; // executed payload we can't statically scope
       pending.push({ text: substitution.body, cwd: currentCwd, cwdKnown });
     }
-    const executableCommand = stripShellSubstitutions(item.text, substitutions);
+    const executableCommand = stripShellSubstitutions(itemText, substitutions);
     const groups = commandGroups(executableCommand);
     for (let gi = 0; gi < groups.length; gi++) {
       const group = groups[gi];
@@ -1878,7 +1909,22 @@ const DENY_TIER_BEHAVIORS: Record<string, true> = {
 
 /** Normalize shell input without treating `#` inside quotes as a comment. */
 export function normalize(cmd: string): string {
-  return stripShellComments(String(cmd ?? ""))
+  // Collapse bash line continuations (`\`+newline) BEFORE any tokenizing —
+  // `cat no\<newline>te` is the single operand `note`.  Inside single
+  // quotes the backslash-newline pair is literal and stays.
+  const input = String(cmd ?? "");
+  let collapsed = "";
+  let singleQuoted = false;
+  for (let i = 0; i < input.length; i++) {
+    const c = input[i];
+    if (c === "'") singleQuoted = !singleQuoted;
+    if (c === "\\" && input[i + 1] === "\n" && !singleQuoted) {
+      i++; // drop both characters — line continuation
+      continue;
+    }
+    collapsed += c;
+  }
+  return stripShellComments(collapsed)
     .replace(/[ \t\r]+/g, " ")
     .replace(/\n{2,}/g, "\n")
     .trim();
@@ -2129,11 +2175,12 @@ export function analyzeBashOperation(
     const work = splitHeredocWork(entry.text);
     if (work.unterminated) heredocUnterminated = true;
     for (const item of work.items) {
-    const substitutions = findShellSubstitutions(item.text);
+    const itemText = normalize(item.text); // comment stripping per logical command (S2)
+    const substitutions = findShellSubstitutions(itemText);
     for (const substitution of substitutions) {
       pending.push({ text: substitution.body, cwd: currentCwd, cwdKnown });
     }
-    const executableCommand = stripShellSubstitutions(item.text, substitutions);
+    const executableCommand = stripShellSubstitutions(itemText, substitutions);
     const groups = commandGroups(executableCommand);
     for (let gi = 0; gi < groups.length; gi++) {
       const group = groups[gi];

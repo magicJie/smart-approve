@@ -1353,3 +1353,41 @@ test("a trailing newline is not a blank line for heredoc termination (N1)", () =
   assert.equal(closed.undeterminable, false);
   assert.deepEqual(closed.targets.map((t) => t.value), ["after.tsv"]);
 });
+
+test("parenthesized groups keep their heredoc expansions (S1)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smart-approve-s1-"));
+  const sub = path.join(dir, "sub");
+  try {
+    fs.mkdirSync(sub);
+    // The expansion must not be lost: $(cat note) inside a parenthesized
+    // group is still analyzed, at the group's cwd.
+    const a = commandFileTargets("( cd sub; cat <<EOF\n$(cat note)\nEOF\n )\n", dir);
+    assert.ok(a.targets.some((t) => t.value === "note"), `note present in ${JSON.stringify(a.targets)}`);
+    assert.equal(a.undeterminable, false);
+    // At root cwd the same construct resolves note at the root.
+    const b = commandFileTargets("( cat <<EOF\n$(cat rootnote)\nEOF\n )\n", dir);
+    assert.ok(b.targets.some((t) => t.cwd === dir && t.value === "rootnote"));
+    assert.equal(b.undeterminable, false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("heredoc-free input keeps whole-text multi-line semantics (S2)", () => {
+  // Quoted newline: ONE filename, not two targets.
+  const quoted = commandFileTargets('cat "a\nb"', "/tmp");
+  assert.deepEqual(quoted.targets.map((t) => t.value), ["a\nb"]);
+  // Backslash continuation: `no\<newline>te` is the single file `note`.
+  const cont = commandFileTargets("cat no\\\nte", "/tmp");
+  assert.deepEqual(cont.targets.map((t) => t.value), ["note"]);
+  // Comment lines are not commands — no privileged-exec from prose.
+  const comments = analyzeCommand("# explanation\n# sudo make me a sandwich\n");
+  assert.ok(!comments.behaviors.includes("privileged-exec"));
+  // A trailing comment is not a file target.
+  const trail = commandFileTargets("cat note # somefile", "/tmp");
+  assert.deepEqual(trail.targets.map((t) => t.value), ["note"]);
+  // Mixed: a heredoc elsewhere doesn't break a multi-line quoted command.
+  const mixed = commandFileTargets('cat <<EOF\nx\nEOF\ncat "multi\nline"\n', "/tmp");
+  assert.ok(mixed.targets.some((t) => t.value === "multi\nline"),
+    `multi-line quoted filename survives: ${JSON.stringify(mixed.targets)}`);
+});
