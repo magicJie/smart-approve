@@ -498,3 +498,24 @@ $ bun run build       # dist/index.js 225.95 KB
 ```
 
 **偏差**：无。
+
+## 二十四、复审修正 R18（对应 REVIEW.md「第十八轮终审 · 31024ae」P1）
+
+复审对象：`31024ae`。M1 已关闭；本轮 P1 必修交付。
+
+| 项 | 修正 | 断言 |
+|----|------|------|
+| P1（EOF 待续行正文入分析） | EOF 时把 `pendingBodyLine` 中尚未写入正文的续行缓冲并入当前正文，再走同一套 `findHeredocSubstitutions` 提取——Bash 对未闭合正文仍执行其替换（带 missing-delimiter 警告）；未闭合标志保留 | `a continuation-open body line at EOF still feeds substitution analysis (P1)`：末行续行的 `$(cat note)` 产生 note 目标且 undeterminable=true、`$(rm -rf …)` 产生行为标签且 requiresConfirmation=true；无续行用例不变 |
+
+**复审修正 R18 后验证**：
+
+```
+$ bun run typecheck   # tsc --noEmit → clean
+$ bun test src
+ 285 pass
+ 0 fail
+Ran 285 tests across 14 files.
+$ bun run build       # dist/index.js 226.17 KB
+```
+
+**偏差**：无。
