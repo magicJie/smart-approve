@@ -1307,3 +1307,24 @@ test("a leading cd in the bash command is applied once, not twice", async () => 
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("bash: unterminated heredoc requires confirmation and headless denies (Q2)", async () => {
+  const command = "cat <<EOF\nnever closed\n";
+  // Empty memory + UI: the command must not be silently authorized.
+  const interactive = makeHarness();
+  const confirmed = await run(BashToolGate, interactive, { command });
+  assert.equal(confirmed.isError, true);
+  assert.equal(interactive.calls.delegate, 0);
+
+  // Headless: no-ui block even when the (empty) analysis looks harmless.
+  const headless = makeHarness({}, { hasUI: false });
+  const blocked = await run(BashToolGate, headless, { command });
+  assert.equal(blocked.isError, true);
+  assert.deepEqual(blocked.details, { blocked: true, reason: "no-ui" });
+  assert.equal(headless.calls.delegate, 0);
+
+  // A closed heredoc with a harmless body is decided normally.
+  const closed = makeHarness({}, { hasUI: false });
+  const ok = await run(BashToolGate, closed, { command: "cat <<EOF\nx\nEOF\n" });
+  assert.notEqual((ok.details as { reason?: string } | undefined)?.reason, "no-ui");
+});

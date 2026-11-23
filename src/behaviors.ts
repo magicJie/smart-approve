@@ -748,46 +748,70 @@ function pathArg(rawToken: string | undefined): PathArg {
   return { value, literal };
 }
 
+/** Command substitutions inside an UNQUOTED heredoc body.  Bash expands
+ *  `$VAR`, `$(cmd)` and backticks there, but quotes have NO syntactic
+ *  meaning — an apostrophe in `it's` is literal text, not a quote opener
+ *  (Q1).  Only `$(...)` / backtick bodies are commands; `$VAR` is data. */
+function findHeredocSubstitutions(body: string): string[] {
+  const result: string[] = [];
+  for (let i = 0; i < body.length; i++) {
+    const c = body[i];
+    if (c === "\\") { i++; continue; } // escaped — literal
+    if (c === "`") {
+      const closing = findClosingBacktick(body, i);
+      if (closing >= 0) {
+        result.push(body.slice(i + 1, closing));
+        i = closing;
+      }
+      continue;
+    }
+    if (c === "$" && body[i + 1] === "(") {
+      const closing = findClosingParenthesis(body, i + 1);
+      if (closing >= 0) {
+        result.push(body.slice(i + 2, closing));
+        i = closing;
+      }
+    }
+  }
+  return result;
+}
+
 /** Remove heredoc bodies so their literal text never becomes commands or
- *  file targets (X4/Z1).  Returns the stripped command plus, for UNQUOTED
- *  delimiters, the command substitutions the body would actually execute
- *  (bash expands `$VAR`, `$(cmd)`, backticks in an unquoted heredoc body —
- *  Z1b); quoted-delimiter bodies are pure data.  `unterminated` marks a
- *  heredoc whose closing delimiter never appeared: the body boundary can't
- *  be proven, so callers must treat the command as undeterminable. */
+ *  file targets (X4/Z1).  For UNQUOTED delimiters the body's command
+ *  substitutions execute for real, so they are inlined at the body's stream
+ *  position — subsequent analysis sees them with the cwd in effect there
+ *  (Q1).  Quoted-delimiter bodies are pure data and vanish.  `unterminated`
+ *  marks a heredoc whose closing delimiter never appeared: the body
+ *  boundary can't be proven and the caller must propagate undeterminable. */
 function stripHeredocBodies(command: string): {
   text: string;
-  substitutionBodies: string[];
   unterminated: boolean;
 } {
   const lines = command.split("\n");
   const out: string[] = [];
   const delimiters: { word: string; dash: boolean; quoted: boolean }[] = [];
-  const substitutionBodies: string[] = [];
   let quote: string | undefined; // carried across lines (multi-line strings)
-  let currentBody: string[] | undefined;
-  let currentQuoted = false;
+  let bodyLines: string[] = [];
 
-  const finishBody = (): void => {
-    if (currentBody && !currentQuoted) {
-      // Only the substitutions execute — the rest of the body is data, so
-      // we extract $(...) / `...` bodies instead of analyzing the raw text.
-      for (const sub of findShellSubstitutions(currentBody.join("\n"))) {
-        substitutionBodies.push(sub.body);
+  const closeBody = (quoted: boolean): void => {
+    if (!quoted) {
+      for (const sub of findHeredocSubstitutions(bodyLines.join("\n"))) {
+        out.push(sub);
       }
     }
-    currentBody = undefined;
+    bodyLines = [];
   };
 
   for (const line of lines) {
     if (delimiters.length > 0) {
+      // Each queued delimiter carries its OWN dash/quoted attributes (Q3).
       const current = delimiters[0];
       const candidate = current.dash ? line.replace(/^\t+/, "") : line;
       if (candidate === current.word) {
+        closeBody(current.quoted);
         delimiters.shift();
-        finishBody();
       } else {
-        (currentBody ??= []).push(line);
+        bodyLines.push(line);
       }
       continue; // body line (or the closing delimiter) — never a command
     }
@@ -817,35 +841,38 @@ function stripHeredocBodies(command: string): {
       let dash = false;
       if (line[j] === "-" || line[j] === "~") { dash = line[j] === "-"; j++; }
       while (line[j] === " " || line[j] === "\t") j++;
-      // Capture the RAW delimiter word (quotes/backslashes intact) then
-      // store its evaluated value — `<<\EOF` and `<<EOF` share the closing
-      // line EOF, while `<<'E\OF'` keeps its literal backslash (Z1a).
+      // Read the COMPLETE delimiter word — quoted and unquoted fragments
+      // concatenate (`<<'E'OF` ≡ `<<EOF`), and ANY quoting (single, double,
+      // or a backslash like `<<\EOF`) makes the body literal (Q3).
       const wordStart = j;
       let quoted = false;
-      if (line[j] === "'" || line[j] === "\"") {
-        quoted = true;
-        const q = line[j];
-        j++;
-        while (j < line.length && line[j] !== q) j++;
-        if (line[j] === q) j++;
-      } else {
-        while (j < line.length && !/[\s;&|()<>\n]/.test(line[j])) {
-          if (line[j] === "\\" && j + 1 < line.length) j++;
+      while (j < line.length) {
+        const d = line[j];
+        if (d === "'" || d === "\"") {
+          quoted = true;
+          const q = d;
+          j++;
+          while (j < line.length && line[j] !== q) j++;
+          if (line[j] === q) j++;
+        } else if (d === "\\" && j + 1 < line.length) {
+          quoted = true;
+          j += 2;
+        } else if (/[\s;&|()<>\n]/.test(d)) {
+          break;
+        } else {
           j++;
         }
       }
       const word = evaluateShellWord(line.slice(wordStart, j));
-      if (word) {
-        delimiters.push({ word, dash, quoted });
-        currentQuoted = quoted;
-        currentBody = [];
-      }
+      if (word) delimiters.push({ word, dash, quoted });
       i = j - 1;
     }
   }
-  // Any body left open at EOF has no provable boundary (Z1b).
+  // A body left open at EOF has no provable boundary — still surface its
+  // substitutions for analysis, but mark the command undeterminable (Q2).
   const unterminated = delimiters.length > 0;
-  return { text: out.join("\n"), substitutionBodies, unterminated };
+  if (unterminated && bodyLines.length > 0) closeBody(delimiters[0].quoted);
+  return { text: out.join("\n"), unterminated };
 }
 
 /** Split at ;, &&, ||, newline, bare & and parens — but NOT single `|`
@@ -1419,12 +1446,9 @@ export function commandFileTargets(
   const pending: { text: string; cwd: string; cwdKnown: boolean }[] = [
     { text: normalize(stripped.text), cwd, cwdKnown: true },
   ];
-  // Unquoted heredoc bodies execute their substitutions (Z1b) — re-analyze
-  // those bodies as real commands; an unterminated body is undeterminable.
-  let heredocUndeterminable = stripped.unterminated;
-  for (const body of stripped.substitutionBodies) {
-    pending.push({ text: body, cwd, cwdKnown: true });
-  }
+  // Unquoted heredoc substitutions are inlined at their stream position in
+  // stripped.text (Q1); an unterminated body is undeterminable (Q2).
+  const heredocUndeterminable = stripped.unterminated;
   while (pending.length > 0) {
     const entry = pending.pop()!;
     currentCwd = entry.cwd;
@@ -1820,7 +1844,7 @@ export function normalize(cmd: string): string {
 export function analyzeCommand(cmd: string): DangerAnalysis {
   const behaviorSet = new Set<string>();
   const stripped = stripHeredocBodies(String(cmd ?? ""));
-  const pending = [stripped.text, ...stripped.substitutionBodies];
+  const pending = [stripped.text];
 
   while (pending.length > 0) {
     const command = normalize(pending.pop() ?? "");
@@ -1998,7 +2022,10 @@ export function analyzeCommand(cmd: string): DangerAnalysis {
   const denyTier =
     !hardBlocked && behaviors.some((behavior) => behavior in DENY_TIER_BEHAVIORS);
 
-  return { behaviors, labels, hardBlocked, denyTier };
+  // Q2: an unterminated heredoc body has no provable boundary — surface the
+  // uncertainty to the gate instead of returning a clean-looking verdict.
+  const requiresConfirmation = stripped.unterminated || undefined;
+  return { behaviors, labels, hardBlocked, denyTier, requiresConfirmation };
 }
 
 /** Localized label lookup shared with the eval analyzer (B2). */
@@ -2042,7 +2069,6 @@ export function analyzeBashOperation(
   const stripped = stripHeredocBodies(command);
   const pending: { text: string; cwd: string; cwdKnown: boolean }[] = [
     { text: normalize(stripped.text), cwd, cwdKnown: true },
-    ...stripped.substitutionBodies.map((body) => ({ text: body, cwd, cwdKnown: true })),
   ];
   while (pending.length > 0) {
     const entry = pending.pop()!;
@@ -2134,6 +2160,7 @@ export function analyzeBashOperation(
     !hardBlocked && behaviors.some((behavior) => behavior in DENY_TIER_BEHAVIORS);
   const requiresConfirmation =
     (analysis.requiresConfirmation ?? false) ||
+    stripped.unterminated || // Q2: unprovable heredoc body boundary
     (!hasUI && behaviorSet.has("shutdown-reboot"));
 
   return { behaviors, labels, hardBlocked, denyTier, requiresConfirmation };

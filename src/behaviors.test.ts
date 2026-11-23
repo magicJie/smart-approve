@@ -1199,3 +1199,59 @@ test("fd numbers compare by value; input dup of a file is invalid (Z1c)", () => 
   assert.deepEqual(input.targets, []);
   assert.equal(input.undeterminable, true);
 });
+
+test("heredoc bodies expand by heredoc rules, not command-line quotes (Q1)", () => {
+  // An apostrophe is literal text in a heredoc body — the substitution
+  // after it still executes.
+  const live = analyzeCommand("cat <<EOF\nit's $(rm -rf /tmp/x)\nEOF\n");
+  assert.ok(live.behaviors.includes("recursive-force-delete"),
+    "apostrophe must not swallow the substitution");
+  // Substitution bodies are analyzed with the cwd in effect at their
+  // stream position — after `cd sub`, $(cat f) reads sub/f.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "smart-approve-q1-"));
+  try {
+    fs.mkdirSync(path.join(dir, "sub"));
+    const targets = commandFileTargets(
+      "cd sub\ncat <<EOF\n$(cat f)\nEOF\n",
+      dir,
+    );
+    assert.ok(targets.targets.some((t) => t.cwd === path.join(dir, "sub") && t.value === "f"),
+      `substitution must inherit the cd'd cwd: ${JSON.stringify(targets)}`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("unterminated heredoc propagates undeterminable to the gate (Q2)", () => {
+  const analysis = analyzeBashOperation("cat <<EOF\nnever closed\n", "/tmp", "/tmp");
+  assert.equal(analysis.requiresConfirmation, true);
+  const viaCommand = analyzeCommand("cat <<EOF\nnever closed\n");
+  assert.equal(viaCommand.requiresConfirmation, true);
+  // A properly closed heredoc needs no confirmation.
+  const closed = analyzeBashOperation("cat <<EOF\nx\nEOF\n", "/tmp", "/tmp");
+  assert.ok(!closed.requiresConfirmation);
+});
+
+test("delimiter quoting forms and per-entry quoted state (Q3)", () => {
+  // Backslash-quoted delimiter → literal body, substitutions do NOT run.
+  const esc = analyzeCommand("cat <<\\EOF\n$(rm -rf /tmp/x)\nEOF\n");
+  assert.ok(!esc.behaviors.includes("recursive-force-delete"),
+    "<<\\EOF body is literal");
+  // Mixed quoted+unquoted fragments: the full word is read, body literal.
+  const mixed = analyzeCommand("cat <<'E'OF\n$(rm -rf /tmp/x)\nEOF\n");
+  assert.ok(!mixed.behaviors.includes("recursive-force-delete"),
+    "<<'E'OF reads the whole word and is quoted");
+  // Two heredocs on one line: the first (unquoted) expands, the second
+  // (quoted) stays data — each entry uses its own quoted flag.
+  const both = analyzeCommand(
+    "cat <<A; cat <<'B'\n$(rm -rf /tmp/first)\nA\n$(rm -rf /tmp/second)\nB\n",
+  );
+  assert.ok(both.behaviors.includes("recursive-force-delete"), "first body expands");
+  const targets = commandFileTargets(
+    "cat <<A; cat <<'B'\n$(rm -rf /tmp/first)\nA\n$(rm -rf /tmp/second)\nB\n",
+    "/tmp",
+  );
+  const values = targets.targets.map((t) => t.value);
+  assert.ok(values.includes("/tmp/first"), "first body target present");
+  assert.ok(!values.includes("/tmp/second"), "second body is data");
+});
