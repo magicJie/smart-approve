@@ -9,7 +9,7 @@
 
 import type { DangerAnalysis } from "./types";
 import { makeLabel } from "./i18n";
-import { isUserWritablePath, resolveFilesystemPathCandidates } from "./paths";
+import { resolveFilesystemPathCandidates } from "./paths";
 import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs";
@@ -129,43 +129,6 @@ function unquoteToken(token: string): string {
 function isAssignment(token: string): boolean {
   return /^[A-Za-z_][A-Za-z0-9_]*=/.test(unquoteToken(token));
 }
-function splitShellCommands(command: string): string[] {
-  const result: string[] = [];
-  let start = 0;
-  let quote: string | undefined;
-  let escaped = false;
-
-  for (let i = 0; i < command.length; i++) {
-    const ch = command[i];
-    if (escaped) {
-      escaped = false;
-      continue;
-    }
-    if (ch === "\\") {
-      escaped = true;
-      continue;
-    }
-    if (quote !== undefined) {
-      if (ch === quote) quote = undefined;
-      continue;
-    }
-    if (ch === "'" || ch === "\"" || ch === "`") {
-      quote = ch;
-      continue;
-    }
-    if (ch === ";" || ch === "|" || ch === "&" || ch === "\n" || ch === "(" || ch === ")") {
-      const segment = command.slice(start, i).trim();
-      if (segment) result.push(segment);
-      start = i + 1;
-      if ((ch === "|" || ch === "&") && command[i + 1] === ch) i++;
-    }
-  }
-
-  const tail = command.slice(start).trim();
-  if (tail) result.push(tail);
-  return result;
-}
-
 /** Remove shell comments without treating `#` inside quotes as a comment. */
 function stripShellComments(command: string): string {
   let result = "";
@@ -982,27 +945,206 @@ function permissionChangeTier(
   return "permission-change-user";
 }
 
-/** Collect chmod/chown/chgrp invocations from a raw command's segments. */
-export function permissionChangeInvocations(command: string): PermissionInvocation[] {
-  const invocations: PermissionInvocation[] = [];
-  const pending = [normalize(command)];
-  while (pending.length > 0) {
-    const text = pending.pop() ?? "";
-    const substitutions = findShellSubstitutions(text);
-    for (const substitution of substitutions) pending.push(substitution.body);
-    const executableCommand = stripShellSubstitutions(text, substitutions);
-    for (const segment of splitShellCommands(executableCommand)) {
-      const invocation = commandAndArgs(segment);
-      if (!invocation) continue;
-      if (invocation.name === "find") {
-        for (const commandArgs of findExecCommands(invocation.args)) {
-          pending.push(commandArgs.map(quoteShellArgument).join(" "));
+/**
+ * Filesystem targets of one stage for domain-scoped allow entries.
+ * `complete:false` means the operand grammar wasn't fully understood —
+ * the domain entry must not match (falls back to normal approval).
+ */
+const FILE_OPTION_VALUE: Record<string, ReadonlySet<string>> = {
+  tar: new Set(["-f", "--file", "-C", "--directory"]),
+  curl: new Set(["-o", "--output", "-O", "--remote-name"]),
+  wget: new Set(["-O", "--output-document", "-P", "--directory-prefix"]),
+  find: new Set(["-path", "-name", "-iname", "-type", "-perm", "-user", "-group",
+    "-size", "-newer", "-regex", "-maxdepth", "-mindepth", "-exec", "-execdir", "-ok", "-okdir"]),
+  sort: new Set(["-k", "-t", "-n", "-o"]),
+  git: new Set(["-C", "--git-dir", "--work-tree", "-c"]),
+};
+
+/** Commands whose operands are never filesystem paths for domain scoping. */
+const NON_FILE_COMMANDS: ReadonlySet<string> = new Set([
+  "echo", "printf", "true", "false", "test", "[", "sleep", "date", "uname",
+  "hostname", "whoami", "id", "groups", "tty", "uptime", "which", "type",
+  "command", "env", "export", "set", "unset", "alias", "history", "jobs",
+  "fg", "bg", "wait", "kill", "pkill", "killall", "ps", "pwd", "exit",
+  "return", "eval", "source", ".", "exec", "time", "times", "ulimit",
+  "umask", "trap", "shift", "getopts", "read", "echo-e", "seq", "yes",
+  "xargs", "nohup", "nice", "timeout", "watch", "clear", "reset",
+  "git", "gh", "npm", "npx", "pnpm", "yarn", "bun", "deno", "pip", "pip3",
+  "python3", "python", "node", "ruby", "perl", "php", "lua", "docker",
+  "kubectl", "systemctl", "service", "curl", "wget", "ssh", "scp", "rsync",
+  "openssl", "nc", "netcat", "ncat", "socat", "telnet", "ping", "dig",
+  "nslookup", "host", "traceroute", "grep", "rg", "egrep", "fgrep", "sed",
+  "awk", "gawk", "diff", "wc", "sort", "uniq", "comm", "cut", "tr", "head",
+  "tail", "less", "more", "man", "info", "apropos", "fd", "rg", "jq", "yq",
+]);
+
+interface FileTargetResult {
+  targets: string[];
+  /** False → operand grammar unclear; domain entries must not apply. */
+  complete: boolean;
+}
+
+/** Operands of a stage, honoring `--` and flag-value skipping. */
+function stageOperands(
+  name: string,
+  args: string[],
+  optionWithValue?: ReadonlySet<string>,
+): string[] {
+  const operands: string[] = [];
+  let i = 0;
+  let optionsDone = false;
+  while (i < args.length) {
+    const arg = args[i];
+    if (!optionsDone && arg === "--") { optionsDone = true; i++; continue; }
+    if (!optionsDone && arg.startsWith("-")) {
+      if (optionWithValue?.has(arg)) { i += 2; continue; }
+      if (arg.includes("=")) { i++; continue; }
+      i++;
+      continue;
+    }
+    operands.push(arg);
+    i++;
+  }
+  return operands;
+}
+
+function fileTargetsOfInvocation(
+  name: string,
+  args: string[],
+): FileTargetResult {
+  if (name === "dd") {
+    const values = args
+      .filter((arg) => /^(?:of|if)=/.test(arg))
+      .map((arg) => arg.slice(arg.indexOf("=") + 1));
+    return { targets: values, complete: true };
+  }
+  if (["chmod", "chown", "chgrp"].includes(name)) {
+    return { targets: permissionTargets(name, args).targets, complete: true };
+  }
+  if (name === "scp") {
+    const operands = stageOperands(name, args);
+    return {
+      targets: operands.filter((arg) => !/^[A-Za-z][A-Za-z0-9+.-]*:/.test(arg) &&
+        !/^[^/]*:/.test(arg)),
+      complete: true,
+    };
+  }
+  if (name === "tee") {
+    const operands = stageOperands(name, args);
+    return { targets: operands, complete: true };
+  }
+  if (name === "tar") {
+    const values: string[] = [];
+    const skip = FILE_OPTION_VALUE.tar;
+    let i = 0;
+    while (i < args.length) {
+      const arg = args[i];
+      if (arg === "--") break;
+      if (skip?.has(arg)) {
+        if (["-f", "--file", "-C", "--directory"].includes(arg) && args[i + 1] !== undefined) {
+          values.push(args[i + 1]);
         }
         i += 2;
         continue;
       }
-      if (["chmod", "chown", "chgrp"].includes(invocation.name)) {
-        invocations.push(invocation);
+      i++;
+    }
+    return { targets: values, complete: true };
+  }
+  if (NON_FILE_COMMANDS.has(name)) return { targets: [], complete: true };
+
+  // Filesystem utilities: every operand is a path.
+  const FILE_COMMANDS = new Set([
+    "cat", "ls", "dir", "stat", "file", "touch", "mkdir", "rmdir", "rm",
+    "cp", "mv", "install", "ln", "link", "unlink", "readlink", "realpath",
+    "basename", "dirname", "du", "df", "tree", "find", "locate", "which",
+    "mktemp", "gzip", "gunzip", "zip", "unzip", "xz", "bzip2", "zstd",
+    "md5sum", "sha1sum", "sha256sum", "cksum", "patch", "diff3", "vim",
+    "vi", "nano", "emacs", "code", "open", "xdg-open", "gpg", "git-add",
+  ]);
+  if (FILE_COMMANDS.has(name)) {
+    const skip = FILE_OPTION_VALUE[name];
+    const operands = stageOperands(name, args, skip);
+    return { targets: operands, complete: true };
+  }
+  // Unknown command with operands: cannot prove domain membership.
+  const operands = stageOperands(name, args);
+  return { targets: [], complete: operands.length === 0 };
+}
+
+/**
+ * Extract every filesystem target of a normalized command for `domain`
+ * allow entries.  Honors quotes (roughTokenize preserves quoted spacing)
+ * and per-segment `cd` state.  `undeterminable` is set when any stage's
+ * operand grammar or dynamic expansion can't be resolved — the caller must
+ * treat the domain check as failed (normal approval), not allowed.
+ */
+export function commandFileTargets(
+  command: string,
+  cwd: string,
+): { targets: { value: string; cwd: string }[]; undeterminable: boolean } {
+  const targets: { value: string; cwd: string }[] = [];
+  let undeterminable = false;
+  let currentCwd = cwd;
+  let cwdKnown = true;
+
+  const pending: { text: string; cwd: string; cwdKnown: boolean }[] = [
+    { text: normalize(command), cwd, cwdKnown: true },
+  ];
+  while (pending.length > 0) {
+    const entry = pending.pop()!;
+    currentCwd = entry.cwd;
+    cwdKnown = entry.cwdKnown;
+    const substitutions = findShellSubstitutions(entry.text);
+    for (const substitution of substitutions) {
+      undeterminable = true; // executed payload we can't statically scope
+      pending.push({ text: substitution.body, cwd: currentCwd, cwdKnown });
+    }
+    const executableCommand = stripShellSubstitutions(entry.text, substitutions);
+    for (const group of commandGroups(executableCommand)) {
+      const stages = pipeStages(group);
+      for (const stage of stages) {
+        const invocation = commandAndArgs(stage);
+        if (!invocation) continue;
+        const { name, args } = invocation;
+
+        const inner = innerWrappedCommand(invocation);
+        if (inner !== undefined) {
+          pending.push({ text: inner, cwd: currentCwd, cwdKnown });
+        }
+        if (name === "find") {
+          for (const commandArgs of findExecCommands(args)) {
+            pending.push({
+              text: commandArgs.map(quoteShellArgument).join(" "),
+              cwd: currentCwd,
+              cwdKnown,
+            });
+          }
+        }
+
+        if (name === "cd") {
+          const operand = args.find((arg) => arg !== "--" && !arg.startsWith("-"));
+          const home = process.env.HOME || os.homedir();
+          const expanded = operand === undefined ? home : expandHomeLiteral(operand, home);
+          if (expanded === undefined || !cwdKnown) {
+            cwdKnown = false;
+            continue;
+          }
+          const candidates = semanticPathCandidates(expanded, currentCwd);
+          currentCwd = candidates[candidates.length - 1] ?? expanded;
+          continue;
+        }
+
+        const result = fileTargetsOfInvocation(name, args);
+        if (!result.complete) undeterminable = true;
+        for (const target of result.targets) {
+          const expanded = expandHomeLiteral(target, process.env.HOME || os.homedir());
+          if (expanded === undefined) {
+            undeterminable = true;
+            continue;
+          }
+          targets.push({ value: expanded, cwd: currentCwd });
+        }
       }
     }
   }

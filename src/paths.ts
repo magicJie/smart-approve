@@ -82,10 +82,6 @@ function globToRegExp(pattern: string): CompiledPattern {
   return { re: new RegExp(re + "$"), negate };
 }
 
-export function matchGlob(pattern: string, value: string): boolean {
-  return globToRegExp(pattern).re.test(value);
-}
-
 /**
  * Test a normalized command against a command glob.
  * Anchored at both ends. `*`/`?` span arguments but never cross command
