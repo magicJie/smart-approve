@@ -1016,6 +1016,15 @@ function splitHeredocWork(command: string): HeredocWork {
       currentItem = undefined;
     }
   }
+  // P1: a body line still open in the continuation buffer at EOF is real
+  // heredoc content — bash executes its substitutions (with a missing-
+  // delimiter warning).  Fold it into the body BEFORE extraction, keeping
+  // the unterminated flag.
+  if (delimiters.length > 0 && pendingBodyLine !== "") {
+    const current = delimiters[0];
+    bodies[current.id] = (bodies[current.id] ? `${bodies[current.id]}\n` : "") + pendingBodyLine;
+    pendingBodyLine = "";
+  }
   const unterminated = delimiters.length > 0 || pendingDeclarations.length > 0;
   for (const d of [...delimiters, ...pendingDeclarations]) finishBody(d.id, d.item, d.group, d.quoted);
   for (const exp of expansions) items[exp.item]?.expansions.push({ group: exp.group, bodies: exp.bodies });
