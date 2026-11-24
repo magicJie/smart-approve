@@ -559,3 +559,23 @@ $ bun run build                         # dist/index.js 226.17 KB（无 src 改�
 ```
 
 **验证结果**（本机 bash 5.2.37，与 codex 基线同版；非交互 `bash --norc` 读 stdin）：`bun test` 332 pass / 0 fail，15 个文件；typecheck 退出 0；build 226.17 KB 与上轮一致。改动文件：新增 `test/corpus/bash-corpus.test.ts`，`package.json` 的 `test` 脚本由 `bun test src` 改为 `bun test`，`tsconfig.json` include 追加 `test/**/*.ts`，本报告追加本节。无 `src/` 代码改动。
+
+## 二十七、autoAllowBehaviors 合入收尾（cherry-pick b7e8999 → 453da43）
+
+**背景**：laptop 的 `~/.omp/agent/smart-approve.json` 已启用 `autoAllowBehaviors`，该 commit 位于 feat/auto-allow-behaviors 分支（b7e8999），不在 rebase 后的 feat/approval-policy-redesign 上；不合并直接部署会丢配置功能。
+
+**方式**：`git cherry-pick b7e8999`，1 个文件冲突（`src/behaviors.test.ts` 两处，均为附加性新增），按两侧都保留原则合并（HEAD 的 codex 重设计语料 + b7e8999 的 autoAllow 用例）。其余文件自动合并。
+
+**语义核对**：
+
+- 过滤位置：`analyzeCommand` 在 `behaviorSet` → `labels`/`hardBlocked`/`denyTier`/`requiresConfirmation` 计算**之前**过滤已配置 id（src/behaviors.ts:2215），满足任务要求。
+- 域级行为不进过滤器：`analyzeBashOperation` 在过滤后的 `analysis.behaviors` 之上再加 `permission-change-*`/`dd-block-device`/`sensitive-working-directory`（src/behaviors.ts:2325-2362），故 autoAllow 无法白名单化路径相关行为——`sensitive-working-directory` 绝对保留。
+- 门顺序不变：gate 仍是 hard-block → 行为为空早放行 → approval（denyTier/requiresConfirmation/记忆 allow 均在 approval 内判断，src/gate.ts:146-189）；过滤后 `behaviors: []` 且 `requiresConfirmation` 未置位时早放行（不弹窗、不调 LLM）。
+- 重设计语义无回退：B8 headless（`!hasUI && shutdown-reboot` → requiresConfirmation，src/behaviors.ts:2373）、denyTier、requiresConfirmation、记忆 allow 不短路 protected 均未触碰。
+
+**契约测试两处改动**（b7e8999 用例与重设计语义对齐，非合并回归）：
+
+1. `computes hard-block on the filtered set`：`sudo id` 在重设计下产生 `privileged-exec`（高风险三级拆分后 `high-risk-executable` 不再作为输出 id），白名单 id 随之更新，测试语义（过滤在 hard-block 计算前）不变。
+2. `does not override sensitive working directories`：重设计将该行为由 hard-block 改为 reviewable（DESIGN §3.1），断言改为 `behaviors` 仍包含该 id + `hardBlocked === false`；autoAllow 语义（域级标志不可被白名单过滤）保持。
+
+**验证**：`bun test` 373 pass / 0 fail（原 366 + autoAllow 7 个用例，src 326 + corpus 47）；`bunx tsc --noEmit` 退出 0；`bun run build` dist/index.js 248.1 KB。合入 commit `453da43`。未 push，双机部署待验收后统一执行。
