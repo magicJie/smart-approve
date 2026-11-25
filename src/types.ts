@@ -211,13 +211,15 @@ export interface DangerAnalysis {
   /** Localized labels for display. */
   labels: { en: string; zh: string }[];
   /** True if any matched behavior is in the regex-confident deny tier.  In
-   *  auto mode with no usable model verdict this fails closed. */
+   *  auto mode with no usable model verdict this fails closed — except for
+   *  confirmation-required operations, which fall back to the user. */
   denyTier: boolean;
   /** True if any matched behavior is in the hard-block set. */
   hardBlocked: boolean;
-  /** Requires a human decision: remembered decisions and auto verdicts do
-   *  not apply, and headless sessions block.  Model analysis still runs as
-   *  dialog evidence when enabled. */
+  /** Confirmation-required operation: remembered decisions never apply and
+   *  headless sessions block before analysis.  In auto mode with a UI an
+   *  allow verdict auto-allows; a block verdict or no usable verdict still
+   *  asks the user (the no-verdict deny-tier block does not apply here). */
   requiresConfirmation?: boolean;
   /** False when this operation cannot be safely keyed for memorized
    *  decisions because its target depends on runtime state (for example an

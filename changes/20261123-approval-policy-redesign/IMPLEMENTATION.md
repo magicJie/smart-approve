@@ -579,3 +579,44 @@ $ bun run build                         # dist/index.js 226.17 KB（无 src 改�
 2. `does not override sensitive working directories`：重设计将该行为由 hard-block 改为 reviewable（DESIGN §3.1），断言改为 `behaviors` 仍包含该 id + `hardBlocked === false`；autoAllow 语义（域级标志不可被白名单过滤）保持。
 
 **验证**：`bun test` 373 pass / 0 fail（原 366 + autoAllow 7 个用例，src 326 + corpus 47）；`bunx tsc --noEmit` 退出 0；`bun run build` dist/index.js 248.1 KB。合入 commit `453da43`。未 push，双机部署待验收后统一执行。
+
+## 二十八、auto 模式下 requiresConfirmation 交由模型裁决（Jay 拍板）
+
+**背景**：此前 `ApprovalFlow.decide` 的 auto 分支以 `autoMode && !request.requiresConfirmation` 为条件，unresolved-cwd、protected-path 写入等请求即使模型给出 `verdict=allow` 也一律弹人工确认。Jay：「unresolved-cwd 这类也让模型裁决，别一刀切弹窗」。
+
+**目标语义**（auto + 有 UI；所有 requiresConfirmation 来源统一，无特判）：
+
+1. `verdict=allow` → 走 `applyAutoDecision` 自动放行，source=model。
+2. `verdict=block` → 仍弹人工确认（弹窗附模型分析），模型对这些操作无自动否决权。
+3. 无有效 verdict → denyTier 命中则阻断（与原先普通请求一致；注意 unresolved-cwd 本身即置 denyTier，故该来源无 verdict 时由弹窗变为 deny-tier 阻断），否则有 UI 弹窗。
+4. interactive、headless 完全不动：`requiresConfirmation && !hasUI` 仍在分析前 fail-closed。
+
+**改动**：`src/approval.ts` auto 分支去除 `!requiresConfirmation` 门限，decision 存在时仅对「block + requiresConfirmation」改为记日志后落入 `askUser`；无 decision 的 denyTier/no-UI/弹窗回退对所有 auto 请求统一生效。`src/index.ts` protected-path 注释同步。README 流程图与 auto 裁决规则补充该语义。
+
+**测试**：`gate.test.ts` 新增 `bash: auto mode lets the model resolve confirmation-required commands`（allow 无弹窗放行 / block 弹窗含模型分析且人可放行可否决 / 无 verdict deny-tier 阻断 / allow 覆盖 denyTier）；重写 `eval: direct protected write helper follows the auto-mode model verdict` 三情形；`template-interpolated protected write` 与 `protected writes do not honor a remembered approval` 的 auto 断言改为无弹窗自动放行；unterminated heredoc 增加 auto+UI allow 用例。`bun test` 374 pass / 0 fail；`tsc --noEmit` 退出 0。
+
+## 二十九、返工（codex 复审必修/建议项）
+
+**口径统一（必修 1）**：auto 无有效裁决时「命中 deny-tier 直接阻断，其余有 UI 询问、无 UI 阻断」。已同步：README 模式表 auto 行（README.md:60，点名 Bash unresolved-cwd 属 deny-tier）、auto 裁决规则 bullet（:83）、模型不可用段（:122）、行为分析段（:173）、proc-cwd 限制（:243）、autoFallback 段（:316）、llmAnalysis 配置表（:326）、MCP 小节（:189，静态 MCP 调用即 deny-tier）与 Eval 写入段（:187，confirmation-required 类 headless 在分析前阻断）；i18n `modeSwitched`/`autoFallbackDeprecated` 中英文案（src/i18n.ts:108/110/169/171）。
+
+**安装形态（必修 2，实测）**：`file:` 依赖经 `bun install` 安装后，`~/.omp/plugins/node_modules/smart-approve` 为**符号链接场**：`src/`、`test/`、`changes/` 下文件及 `package.json`/`README.md`/`tsconfig.json` 均是指向 worktree 的符号链接，`dist/index.js` 同样是指向 `/data/repos/magicjie/smart-approve/dist/index.js` 的**符号链接**（非硬链接）。故仓库 `bun run build` 重建 dist 后安装副本自动跟随，无需重新 install；`.git/` 为 bun 复制的实体目录（含 worktree 引用，勿在插件目录内跑 git 操作）。反例：若未来改为复制安装，`bun install` 刷新步骤不可省。
+
+**注释返工（建议 3）**：`ApprovalRequest.requiresConfirmation`（src/approval.ts:81）、headless 前置阻断注释（:168）、`DangerAnalysis.requiresConfirmation`（src/types.ts:218）均改写为「记忆决策不适用 + headless 阻断；auto+UI 下 allow 放行、block/无裁决仍询问（deny-tier 无裁决直接阻断）」；`handleProtectedPaths` 补 `needsReview` 仅含未被人工记忆覆盖目标的注释（src/index.ts:462）。
+
+**新增测试（建议 4）**：`bash: deny tier blocks without a verdict even when a UI could ask`（非 requiresConfirmation 请求 + denyTier + 无 verdict + 有 UI → 零弹窗直接 deny-tier 阻断）；`eval: repeated model allows on a protected write never touch the allow-list`（同一 protected 写连续两次：analyze=2、delegate=2、零弹窗、session/permanent 记忆均为 0）。
+
+## 三十、方案 A：requiresConfirmation 无 verdict 回落人工（agy 复审 Finding-1，Jay 拍板）
+
+**背景**：第一轮实现里 auto 无有效裁决时 denyTier 一律 fail-closed，导致确认类操作（unresolved-cwd、未闭合 heredoc、动态写路径、protected 写入等）在模型失联时直接阻断。
+
+**单调性倒挂（agy Finding-1）**：模型明确给 block 时用户有弹窗入口可以放行/否决，模型完全失联时用户反而没有任何入口——越没信息越不给人类决定，方向反了。且 denyTier 覆盖面含 `cd` 到不存在目录、`mkdir && cd`、eval 动态写路径等常见形态，模型故障时常见命令会无弹窗卡死。
+
+**改动**：`src/approval.ts` 无 verdict 分支的 denyTier 条件改为 `request.denyTier && !request.requiresConfirmation`（:214）。结果矩阵（auto + 有 UI）：
+
+- requiresConfirmation：allow → 自动放行；block 或无 verdict → `askUser` 弹窗（附模型分析/无裁决提示）。
+- 非确认类 denyTier（如裸 `git push -f origin main`）：无 verdict 仍直接 deny-tier 阻断。
+- headless（`requiresConfirmation && !hasUI`）前置 fail-closed 不动。
+
+**配套**：approval.ts/types.ts 两处 requiresConfirmation 与 denyTier 注释同步；README 全部「无裁决」口径改为「非确认类 denyTier 直阻、其余有 UI 询问、无 UI 阻断」，并点名 unresolved-cwd 属确认类回落弹窗（:43/:60/:82/:83/:122/:149/:173/:189/:243/:316/:326）；i18n modeSwitched/autoFallbackDeprecated 中英文案同步。
+
+**测试**：`bash: auto mode lets the model resolve confirmation-required commands` 无 verdict 两个子用例改为弹窗断言（含未闭合 heredoc + force-push 的「确认类+行为级 denyTier」用例），`denyTierAllowed` 补强 analyze=1/零弹窗/notify 断言；新增 `bash: deny tier blocks without a verdict even when a UI could ask`（非确认类 denyTier 仍直阻）、heredoc 用例的 auto+UI 无 verdict 弹窗与 auto+autoInHeadless+headless 分析前阻断断言、`eval: computed write targets follow the auto-mode verdict matrix`（allow 自动放行 / block 弹窗 / no-verdict 弹窗）。

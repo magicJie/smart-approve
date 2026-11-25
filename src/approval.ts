@@ -78,12 +78,16 @@ export interface ApprovalRequest {
   /** Cwd in effect before the subject's own `cd` segments; used for
    *  domain-scoped allow-list matching (R3).  Defaults to `cwd`. */
   analysisCwd?: string;
-  /** Local redesign: operation requires a human decision — remembered
-   *  decisions and auto verdicts never apply, and headless blocks.  Model
-   *  analysis still runs as dialog evidence when enabled. */
+  /** Confirmation-required operation: remembered decisions never apply and
+   *  headless blocks before analysis.  In auto mode with a UI an allow
+   *  verdict auto-allows; a block verdict or no usable verdict still asks
+   *  the user (the no-verdict deny-tier block does not apply here), so the
+   *  model never holds an automatic veto and the human never loses the
+   *  decision entry point. */
   requiresConfirmation?: boolean;
   /** Local redesign: regex-confident deny tier.  Auto mode with no usable
-   *  model verdict fails closed instead of asking or allowing. */
+   *  model verdict fails closed instead of asking or allowing — except for
+   *  confirmation-required operations, which still fall back to the user. */
   denyTier?: boolean;
   rememberScope: "session" | "both";
   /** Overrides the default "Dangerous command" dialog title. */
@@ -163,8 +167,9 @@ export class ApprovalFlow {
     // when the global mode is interactive (DESIGN §7.1 worker goal).
     const autoMode = config.mode === "auto" || (!hasUI && config.autoInHeadless);
 
-    // Protected/undeterminable operations always need a human; headless
-    // blocks regardless of mode or model verdict (local redesign).
+    // Confirmation-required operations cannot resolve headless: block
+    // regardless of mode or model verdict, before any analysis (local
+    // redesign).
     if (request.requiresConfirmation && !hasUI) {
       logger.log(`${request.toolName}: protected operation blocked (no UI) — ${request.label}`);
       return this.block(request, "no-ui", t.blockedNoUI, t.decisionSourceNoUI);
@@ -195,34 +200,50 @@ export class ApprovalFlow {
       );
     }
 
-    if (autoMode && !request.requiresConfirmation) {
+    if (autoMode) {
       if (decision) {
-        return this.applyAutoDecision(request, decision, analysis, ctx);
-      }
-      if (request.denyTier) {
-        // Regex-confident deny tier with no usable model verdict: fail
-        // closed (local redesign deny-tier fallback, §八).
-        logger.log(`${request.toolName}: auto decision=block reason=deny-tier (${request.label})`);
-        ctx.ui.notify?.(t.autoBlockedDenyTier(request.label), "warning");
-        return {
-          allowed: false,
-          source: "deny-tier",
-          result: this.error(
-            `${t.autoBlockedDenyTier(request.label)}\n${request.subjectLabel}: ${request.displaySubject}`,
-            { blocked: true, reason: "deny-tier" },
-          ),
-        };
-      }
-      if (!hasUI) {
-        logger.log(`${request.toolName}: blocked (no verdict, no UI) — ${request.label}`);
-        return this.block(
-          request,
-          "no-verdict",
-          t.blockedNoVerdictNoUI,
-          t.decisionSourceNoVerdictNoUI,
+        // Confirmation-required operations (protected paths, unresolved
+        // cwd/targets, …): an allow verdict auto-allows like any other
+        // request, but a block verdict stays advisory — the human keeps the
+        // final allow/deny decision with the model analysis as evidence.
+        if (decision.verdict === "allow" || !request.requiresConfirmation) {
+          return this.applyAutoDecision(request, decision, analysis, ctx);
+        }
+        logger.log(
+          `${request.toolName}: model verdict=block escalated to user (requiresConfirmation) — ${request.label}`,
         );
+      } else {
+        if (request.denyTier && !request.requiresConfirmation) {
+          // Regex-confident deny tier with no usable model verdict: fail
+          // closed (local redesign deny-tier fallback, §八).  Exempt
+          // confirmation-required operations: they fall back to the human
+          // like any other no-verdict case — blocking them here would leave
+          // the user with less say when the model is silent than when it
+          // explicitly vetoes (monotonicity inversion), and the deny tier
+          // covers common shapes like unresolved cwd or dynamic write
+          // targets that would stall without a prompt on model outages.
+          logger.log(`${request.toolName}: auto decision=block reason=deny-tier (${request.label})`);
+          ctx.ui.notify?.(t.autoBlockedDenyTier(request.label), "warning");
+          return {
+            allowed: false,
+            source: "deny-tier",
+            result: this.error(
+              `${t.autoBlockedDenyTier(request.label)}\n${request.subjectLabel}: ${request.displaySubject}`,
+              { blocked: true, reason: "deny-tier" },
+            ),
+          };
+        }
+        if (!hasUI) {
+          logger.log(`${request.toolName}: blocked (no verdict, no UI) — ${request.label}`);
+          return this.block(
+            request,
+            "no-verdict",
+            t.blockedNoVerdictNoUI,
+            t.decisionSourceNoVerdictNoUI,
+          );
+        }
+        logger.log(`${request.toolName}: no verdict, asking user — ${request.label}`);
       }
-      logger.log(`${request.toolName}: no verdict, asking user — ${request.label}`);
     }
 
     return this.askUser(request, analysis, decision, ctx, signal);

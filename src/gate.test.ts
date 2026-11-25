@@ -342,6 +342,94 @@ test("bash: unresolved dynamic cwd is model-reviewed but never remembered", asyn
   assert.equal(dynamicParam.calls.delegate, 0);
 });
 
+test("bash: auto mode lets the model resolve confirmation-required commands", async () => {
+  const command = 'cd "$WORKING_DIR" && echo safe';
+
+  // verdict=allow: auto-allows without a dialog (source=model).
+  const allowed = makeHarness({ mode: "auto" });
+  const allowedResult = await run(BashToolGate, allowed, { command });
+  assert.equal(allowedResult.content[0].text, "native-run");
+  assert.equal(allowed.calls.analyze, 1);
+  assert.equal(allowed.calls.delegate, 1);
+  assert.equal(allowed.calls.confirmBodies.length, 0);
+  assert.equal(allowed.selectChoices, null);
+  assert.match(allowed.calls.notify[0], /Auto-allowed/);
+
+  // verdict=block: still asks the human; the model analysis is evidence.
+  const blocked = makeHarness(
+    { mode: "auto" },
+    { analyzeResult: { risk: "high", recommend: "allow" } },
+  );
+  const reviewed = await run(BashToolGate, blocked, { command });
+  assert.equal(reviewed.content[0].text, "native-run");
+  assert.equal(blocked.calls.delegate, 1);
+  assert.equal(blocked.calls.confirmBodies.length, 1);
+  assert.match(blocked.calls.confirmBodies[0], /Risk: high/);
+  assert.match(blocked.calls.confirmBodies[0], /Decision source: model analysis/);
+
+  const vetoed = makeHarness(
+    { mode: "auto" },
+    { analyzeResult: { risk: "high", recommend: "deny" } },
+  );
+  vetoed.confirmResult = false;
+  const denied = await run(BashToolGate, vetoed, { command });
+  assert.equal(denied.isError, true);
+  assert.equal(vetoed.calls.confirmBodies.length, 1);
+  assert.equal(vetoed.calls.delegate, 0);
+
+  // No usable verdict: even though unresolved cwd is deny-tier,
+  // confirmation-required operations fall back to the human (plan A) —
+  // the user keeps the decision entry point.
+  const noVerdict = makeHarness({ mode: "auto" }, { analyzeResult: null });
+  const noVerdictResult = await run(BashToolGate, noVerdict, { command });
+  assert.equal(noVerdictResult.content[0].text, "native-run");
+  assert.equal(noVerdict.calls.confirmBodies.length, 1);
+  assert.match(noVerdict.calls.confirmBodies[0], /no usable model verdict/);
+  assert.equal(noVerdict.calls.delegate, 1);
+
+  const noVerdictDenied = makeHarness({ mode: "auto" }, { analyzeResult: null });
+  noVerdictDenied.confirmResult = false;
+  const noVerdictDeniedResult = await run(BashToolGate, noVerdictDenied, { command });
+  assert.equal(noVerdictDeniedResult.isError, true);
+  assert.equal(noVerdictDenied.calls.confirmBodies.length, 1);
+  assert.equal(noVerdictDenied.calls.delegate, 0);
+
+  // No verdict + behavioral deny tier on a confirmation-required command
+  // (unterminated heredoc + force-push): still falls back to the user.
+  const denyTier = makeHarness({ mode: "auto" }, { analyzeResult: null });
+  const denyTierResult = await run(BashToolGate, denyTier, {
+    command: "cat <<EOF\nnever closed\ngit push --force origin main",
+  });
+  assert.equal(denyTierResult.isError, true);
+  assert.equal(denyTier.calls.selectBodies.length, 1);
+  assert.equal(denyTier.calls.delegate, 0);
+  assert.notEqual(reasonOf(denyTierResult), "deny-tier");
+
+  // An allow verdict overrides the deny tier only through the model path.
+  const denyTierAllowed = makeHarness({ mode: "auto" });
+  const denyTierAllowedResult = await run(BashToolGate, denyTierAllowed, {
+    command: 'cd "$WORKING_DIR" && git push --force origin main',
+  });
+  assert.equal(denyTierAllowedResult.content[0].text, "native-run");
+  assert.equal(denyTierAllowed.calls.analyze, 1);
+  assert.equal(denyTierAllowed.calls.delegate, 1);
+  assert.equal(denyTierAllowed.calls.confirmBodies.length, 0);
+  assert.equal(denyTierAllowed.selectChoices, null);
+  assert.match(denyTierAllowed.calls.notify[0], /Auto-allowed/);
+});
+
+test("bash: deny tier blocks without a verdict even when a UI could ask", async () => {
+  // Non-confirmation request (no unresolved cwd): deny tier + no model
+  // verdict fail-closes without ever showing a dialog.
+  const h = makeHarness({ mode: "auto" }, { analyzeResult: null });
+  const r = await run(BashToolGate, h, { command: "git push --force origin main" });
+  assert.equal(r.isError, true);
+  assert.deepEqual(r.details, { blocked: true, reason: "deny-tier" });
+  assert.equal(h.calls.confirmBodies.length, 0);
+  assert.equal(h.selectChoices, null);
+  assert.equal(h.calls.delegate, 0);
+});
+
 test("bash: hard-block wins over everything", async () => {
   const h = makeHarness({}, { isAllowed: true });
   const r = await run(BashToolGate, h, { command: "rm -rf /" });
@@ -826,13 +914,13 @@ test("eval: template-interpolated content cannot hide a protected write", async 
     "await tool.write({path:'notes.md',content:hidden})";
 
   const auto = makeHarness({ mode: "auto" });
-  // Protected write: even auto mode asks the human (model is evidence only).
-  auto.selectResult = auto.deps.t.sessionAllow;
+  // Protected write + allow verdict: auto mode delegates without a dialog.
   const automatic = await run(EvalToolGate, auto, { language: "js", code });
   assert.equal(automatic.content[0].text, "native-run");
   assert.equal(auto.calls.delegate, 1);
   assert.equal(auto.calls.analyze, 1);
-  assert.equal(auto.selectChoices?.length, 1);
+  assert.equal(auto.selectChoices, null);
+  assert.match(auto.calls.notify[0], /Auto-allowed/);
 
   const interactive = makeHarness();
   interactive.selectResult = "Allow for this session";
@@ -877,25 +965,54 @@ test("eval: object tool.write file targets still apply protected-path checks", a
   assert.equal(noVerdict.calls.delegate, 0);
 });
 
-test("eval: direct protected write helper requires confirmation despite a valid model verdict", async () => {
-  const h = makeHarness({ mode: "auto" });
-  h.selectResult = h.deps.t.sessionAllow;
-  const r = await run(EvalToolGate, h, {
-    language: "js",
-    code: 'await write(".env", "secret")',
-  });
-  assert.equal(r.content[0].text, "native-run");
-  assert.equal(h.calls.analyze, 1);
-  assert.equal(h.calls.delegate, 1);
-  assert.equal(h.selectChoices?.length, 1);
+test("eval: direct protected write helper follows the auto-mode model verdict", async () => {
+  const code = 'await write(".env", "secret")';
+
+  // verdict=allow: auto-allows without a dialog.
+  const allowed = makeHarness({ mode: "auto" });
+  const allowedResult = await run(EvalToolGate, allowed, { language: "js", code });
+  assert.equal(allowedResult.content[0].text, "native-run");
+  assert.equal(allowed.calls.analyze, 1);
+  assert.equal(allowed.calls.delegate, 1);
+  assert.equal(allowed.selectChoices, null);
+  assert.match(allowed.calls.notify[0], /Auto-allowed/);
+
+  // verdict=block: the human still decides; the model cannot auto-deny a
+  // protected write, and the dialog carries the model analysis.
+  const blocked = makeHarness(
+    { mode: "auto" },
+    { analyzeResult: { risk: "high", recommend: "deny" } },
+  );
+  blocked.selectResult = blocked.deps.t.sessionAllow;
+  const reviewed = await run(EvalToolGate, blocked, { language: "js", code });
+  assert.equal(reviewed.content[0].text, "native-run");
+  assert.equal(blocked.calls.delegate, 1);
+  assert.equal(blocked.selectChoices?.length, 1);
+  assert.match(blocked.calls.selectBodies[0], /Decision source: model analysis/);
+
+  const vetoed = makeHarness(
+    { mode: "auto" },
+    { analyzeResult: { risk: "high", recommend: "deny" } },
+  );
+  const denied = await run(EvalToolGate, vetoed, { language: "js", code });
+  assert.equal(denied.isError, true);
+  assert.equal(vetoed.selectChoices?.length, 1);
+  assert.equal(vetoed.calls.delegate, 0);
+
+  // No usable verdict: the user is asked, as before.
+  const noVerdict = makeHarness({ mode: "auto" }, { analyzeResult: null });
+  noVerdict.selectResult = noVerdict.deps.t.sessionAllow;
+  const noVerdictResult = await run(EvalToolGate, noVerdict, { language: "js", code });
+  assert.equal(noVerdictResult.content[0].text, "native-run");
+  assert.equal(noVerdict.selectChoices?.length, 1);
+  assert.match(noVerdict.calls.selectBodies[0], /no usable model verdict/);
+  assert.equal(noVerdict.calls.delegate, 1);
 });
 
 test("eval protected writes do not honor a remembered approval", async () => {
-  // Protected writes always need a human decision; a remembered entry must
-  // not short-circuit the review (local redesign: allow-list is gated on
-  // !requiresConfirmation).
+  // A remembered entry must not short-circuit the review (local redesign:
+  // allow-list is gated on !requiresConfirmation); the model verdict decides.
   const h = makeHarness({ mode: "auto" }, { isAllowed: true });
-  h.selectResult = h.deps.t.sessionAllow;
   const r = await run(EvalToolGate, h, {
     language: "js",
     code: 'await write(".env", "secret")',
@@ -903,7 +1020,25 @@ test("eval protected writes do not honor a remembered approval", async () => {
   assert.equal(r.content[0].text, "native-run");
   assert.equal(h.calls.analyze, 1);
   assert.equal(h.calls.delegate, 1);
-  assert.equal(h.selectChoices?.length, 1);
+  assert.equal(h.selectChoices, null);
+  assert.match(h.calls.notify[0], /Auto-allowed/);
+});
+
+test("eval: repeated model allows on a protected write never touch the allow-list", async () => {
+  // Confirmation-required writes are not remembered: each call re-analyzes,
+  // auto-allows on the allow verdict, and writes nothing to the allow-list.
+  const h = makeHarness({ mode: "auto" });
+  const params = { language: "js", code: 'await write(".env", "secret")' };
+  const first = await run(EvalToolGate, h, params);
+  const second = await run(EvalToolGate, h, params);
+  assert.equal(first.content[0].text, "native-run");
+  assert.equal(second.content[0].text, "native-run");
+  assert.equal(h.calls.analyze, 2);
+  assert.equal(h.calls.delegate, 2);
+  assert.equal(h.selectChoices, null);
+  assert.equal(h.calls.confirmBodies.length, 0);
+  assert.equal(h.calls.session.length, 0);
+  assert.equal(h.calls.permanent.length, 0);
 });
 
 test("eval computed file-write targets require human review", async () => {
@@ -923,6 +1058,43 @@ test("eval computed file-write targets require human review", async () => {
   assert.equal(reasonOf(blocked), "no-ui");
   assert.equal(noVerdict.calls.analyze, 0);
   assert.equal(noVerdict.calls.delegate, 0);
+});
+
+test("eval: computed write targets follow the auto-mode verdict matrix", async () => {
+  const code = "await Bun.write(target, content)";
+
+  // verdict=allow: auto-allows without a dialog.
+  const allowed = makeHarness({ mode: "auto" });
+  const allowedResult = await run(EvalToolGate, allowed, { language: "js", code });
+  assert.equal(allowedResult.content[0].text, "native-run");
+  assert.equal(allowed.calls.analyze, 1);
+  assert.equal(allowed.calls.delegate, 1);
+  assert.equal(allowed.calls.confirmBodies.length, 0);
+  assert.equal(allowed.selectChoices, null);
+  assert.match(allowed.calls.notify[0], /Auto-allowed/);
+
+  // verdict=block: still asks the human — the model gets no automatic veto.
+  const blocked = makeHarness(
+    { mode: "auto" },
+    { analyzeResult: { risk: "high", recommend: "deny" } },
+  );
+  const reviewed = await run(EvalToolGate, blocked, { language: "js", code });
+  assert.equal(reviewed.content[0].text, "native-run");
+  assert.equal(blocked.calls.delegate, 1);
+  assert.ok(
+    blocked.calls.confirmBodies.length + blocked.calls.selectBodies.length >= 1,
+    "expected a confirmation dialog for a block verdict",
+  );
+
+  // No usable verdict: plan A — falls back to the user instead of blocking.
+  const noVerdict = makeHarness({ mode: "auto" }, { analyzeResult: null });
+  const noVerdictResult = await run(EvalToolGate, noVerdict, { language: "js", code });
+  assert.equal(noVerdictResult.content[0].text, "native-run");
+  assert.equal(noVerdict.calls.delegate, 1);
+  assert.ok(
+    noVerdict.calls.confirmBodies.length + noVerdict.calls.selectBodies.length >= 1,
+    "expected a confirmation dialog when there is no verdict",
+  );
 });
 
 test("eval: dynamic write targets ignore remembered decisions and offer no memory", async () => {
@@ -1337,6 +1509,44 @@ test("bash: unterminated heredoc requires confirmation and headless denies (Q2)"
   assert.equal(blocked.isError, true);
   assert.deepEqual(blocked.details, { blocked: true, reason: "no-ui" });
   assert.equal(headless.calls.delegate, 0);
+
+  // Auto + UI + allow verdict: the model resolves it without a dialog.
+  const auto = makeHarness({ mode: "auto" });
+  const autoResult = await run(BashToolGate, auto, { command });
+  assert.equal(autoResult.content[0].text, "native-run");
+  assert.equal(auto.calls.delegate, 1);
+  assert.equal(auto.calls.confirmBodies.length, 0);
+  assert.equal(auto.selectChoices, null);
+
+
+  // Auto + UI + no usable verdict (requiresConfirmation without denyTier):
+  // plan A — the human is asked, nothing is silently blocked or run.
+  const autoNoVerdict = makeHarness({ mode: "auto" }, { analyzeResult: null });
+  autoNoVerdict.selectResult = "Allow for this session";
+  const noVerdictResult = await run(BashToolGate, autoNoVerdict, { command });
+  assert.equal(noVerdictResult.content[0].text, "native-run");
+  assert.equal(autoNoVerdict.calls.analyze, 1);
+  assert.equal(autoNoVerdict.calls.delegate, 1);
+  assert.equal(autoNoVerdict.calls.selectBodies.length, 1);
+  assert.match(autoNoVerdict.calls.selectBodies[0], /no usable model verdict/);
+
+  const autoNoVerdictDenied = makeHarness({ mode: "auto" }, { analyzeResult: null });
+  const deniedResult = await run(BashToolGate, autoNoVerdictDenied, { command });
+  assert.equal(deniedResult.isError, true);
+  assert.equal(autoNoVerdictDenied.calls.selectBodies.length, 1);
+  assert.equal(autoNoVerdictDenied.calls.delegate, 0);
+
+  // Auto + headless: confirmation-required commands block before analysis
+  // even with autoInHeadless enabled — the model is never consulted.
+  const autoHeadless = makeHarness(
+    { mode: "auto", autoInHeadless: true },
+    { hasUI: false },
+  );
+  const autoBlocked = await run(BashToolGate, autoHeadless, { command });
+  assert.equal(autoBlocked.isError, true);
+  assert.deepEqual(autoBlocked.details, { blocked: true, reason: "no-ui" });
+  assert.equal(autoHeadless.calls.analyze, 0);
+  assert.equal(autoHeadless.calls.delegate, 0);
 
   // A closed heredoc with a harmless body is decided normally.
   const closed = makeHarness({}, { hasUI: false });

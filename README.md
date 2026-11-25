@@ -37,7 +37,10 @@ LLM calls bash / eval / write / edit / …
               │
               ├─ auto mode
               │    ├─ valid verdict → allow or block by policy
+              │    │    (confirmation-required operations: allow executes,
+              │    │     a block verdict still asks you — no auto-denial)
               │    └─ no valid verdict → UI asks the user; no UI blocks
+              │         (non-confirmation deny-tier operations block)
               └─ interactive mode
                    └─ dialog shows the model analysis; user decides
                       (a missing verdict is shown as such)
@@ -54,7 +57,7 @@ Two approval modes:
 | Mode | Dangerous operations |
 |---|---|
 | `interactive` (default) | Model analysis is shown in a dialog; you choose session-allow / permanent-allow / deny. A missing verdict is shown in the dialog; the decision still belongs to you |
-| `auto` | A valid model verdict decides: block or execute. No dialogs for automatic decisions (non-blocking notifications only); without a valid verdict, a UI session asks you and a headless session blocks |
+| `auto` | A valid model verdict decides: block or execute. No dialogs for automatic decisions (non-blocking notifications only); without a valid verdict, non-confirmation deny-tier operations (e.g. force-push to a protected branch) block outright, other operations ask you in a UI session and block headless |
 
 Configured protected-path writes go through the same flow: model analysis first, then the interactive dialog or a valid auto verdict. Matching a protected path is not by itself a mandatory human prompt. Recognized high-risk process launches, recursive force deletes, sensitive working directories, writes to system-sensitive files/devices, and system account-file references in Bash commands or spawned Eval arguments are hard-blocked.
 
@@ -76,7 +79,8 @@ The current mode is also shown as a persistent status-bar chip. The command writ
 Auto-mode decision rules:
 
 - A valid model verdict is required for an automatic decision: a parseable `risk` and/or `recommend`. `recommend: "deny"` blocks; `risk` at or above `autoBlockRisk` blocks; `risk=high` but `recommend=allow` blocks (the stricter signal wins — command text is untrusted input).
-- No valid verdict (model chain failure, invalid answer, timeout, cancellation, or `llmAnalysis: false`): with a UI the user is asked; without a UI the operation is blocked. There is no regex fallback and no automatic allow.
+- Confirmation-required operations — protected-path writes, an unresolved working directory, unterminated heredocs, computed write targets, dynamic host-tool dispatch, external `%run`/`%load` sources — also follow the model verdict in auto mode with a UI: `allow` executes without a dialog, but a `block` verdict or no verdict at all still asks you (the dialog includes the model analysis when present). The model never gets an automatic veto over these operations and the user never loses the decision entry point; the final denial stays with you. Headless sessions keep the fail-closed behavior: these operations block before any model call.
+- No valid verdict (model chain failure, invalid answer, timeout, cancellation, or `llmAnalysis: false`): non-confirmation deny-tier operations block outright; everything else — including confirmation-required operations such as Bash commands with an unresolved working directory — is asked in a UI session and blocked without one. There is no regex fallback and no automatic allow.
 - Auto-mode approvals are **not** written to the allow-list (model verdicts can change; remembered approvals should stay human decisions).
 - Force-push to `main`/`master`/`production`/`prod`/`release`/`trunk` is a reviewed behavior, not a silent regex block. Hard-block rules always win.
 
@@ -115,7 +119,7 @@ Both native APIs receive the session context, detected behavior labels, and the 
 
 For example, OMP 18.10+ can use `openrouter/openai/gpt-6-luna-decisions`. Pi requires a registered classifier model, such as `openai/gpt-6-luna` with `OPENAI_API_KEY` or OpenRouter's TypeSafe Jev classifier. Use the exact `provider/model-id` exposed by that host; Pi's current OpenRouter classifier catalog does not list the OpenAI Decisions model.
 
-If a selected native model is unavailable, returns invalid answers, times out, or is cancelled, analysis returns no verdict; it is not silently sent through a different chat model. In interactive mode the dialog says the model has no usable verdict and the user still decides. In auto mode, a UI session asks the user; without a UI the operation is blocked. `autoFallback` no longer changes this.
+If a selected native model is unavailable, returns invalid answers, times out, or is cancelled, analysis returns no verdict; it is not silently sent through a different chat model. In interactive mode the dialog says the model has no usable verdict and the user still decides. In auto mode, non-confirmation deny-tier operations block outright; the rest are asked in a UI session and blocked without one. `autoFallback` no longer changes this.
 
 The configured `analysisTimeoutMs` bounds each chat attempt and the complete native judgment attempt. `0` disables the plugin deadline; provider-level limits still apply.
 
@@ -142,7 +146,7 @@ Command-specific checks preserve destructive Git, container, and filesystem rule
 
 `EvalCodeBehaviorAnalyzer` scrubs comments before matching and removes string literals only for spawn-API detection; embedded command text is then inspected for launch and destructive-payload patterns:
 
-Static analysis decides what evidence to hand the model. When a target cannot be determined statically — a computed path, an unresolved working directory, `%run`/`%load`, or dynamic MCP dispatch — the cell is still reviewed; it is not auto-approved or skipped. Without a valid model verdict, a UI session asks the user and a headless session blocks.
+Static analysis decides what evidence to hand the model. When a target cannot be determined statically — a computed path, an unresolved working directory, `%run`/`%load`, or dynamic MCP dispatch — the cell is still reviewed; it is not auto-approved or skipped. In auto mode a valid `allow` verdict executes it; without a valid model verdict a UI session still asks the user (the deny-tier block does not apply to these confirmation-required cases) and a headless session blocks.
 
 - **JS/Bun**: ``Bun.$`…` ``, `Bun.spawn`, `Bun.spawnSync`, `Bun.shell`, `child_process` imports, and Node `exec`/`spawn` APIs
 - **Python**: `subprocess` (including `run`, `Popen`, `check_call`, and `check_output`), `asyncio.create_subprocess_*`, `os.system`/`os.popen`, `os.exec*`/`os.spawn*`, `os.fork`/`os.forkpty`, `os.posix_spawn*`, and `multiprocessing.Process` (including bare `Process` when multiprocessing is imported)
@@ -166,7 +170,7 @@ The Bash analyzer hard-blocks these launch shapes — no LLM review, no allow-li
 - `chmod`/`chown`, `rm -rf` variants (including `rm -r -f` and long forms), `dd ... of=...`, and sensitive working directories outside the session root;
 - `mkfs`, shutdown/reboot, raw block-device writes, root deletion, fork bombs, remote fetch-and-execute, and `/etc/passwd`/`/etc/shadow`/`/etc/sudoers` references.
 
-Force-push to a protected branch is reviewed by the model, distinct from these hard blocks. Eval subprocess code (including Python `!` escapes and `%%bash`) receives static process-intent, sensitive-working-directory, and destructive-payload checks. Reviewable operations use the model: interactive mode shows the analysis and lets the user decide; auto mode applies a valid verdict, asks in a UI when there is none, and blocks headless without one.
+Force-push to a protected branch is reviewed by the model, distinct from these hard blocks. Eval subprocess code (including Python `!` escapes and `%%bash`) receives static process-intent, sensitive-working-directory, and destructive-payload checks. Reviewable operations use the model: interactive mode shows the analysis and lets the user decide; auto mode applies a valid verdict, blocks non-confirmation deny-tier operations when there is none, asks in a UI otherwise, and blocks headless without one.
 
 ### 4. Protected paths and Eval file writes
 
@@ -180,9 +184,9 @@ Force-push to a protected branch is reviewed by the model, distinct from these h
 
 Matching is **symlink-aware** for file paths. `apply_patch` targets are extracted from patch headers; `edit` uses the host's derived `path`/`paths`; `ast_edit` checks explicit `paths` before its staged preview.
 
-OMP Eval's `write(path, content)` helper writes directly from the retained runtime and does not emit a `write` tool call. Smart Approve checks literal targets for `write`, `Bun.write`, `writeFile`, and `open(..., "w"/"a"/"x")`. A protected literal target goes through the same review flow as file tools: model analysis first, then the interactive dialog or a valid auto verdict. A computed target is also reviewed, not automatically allowed; headless calls without a valid verdict are blocked.
+OMP Eval's `write(path, content)` helper writes directly from the retained runtime and does not emit a `write` tool call. Smart Approve checks literal targets for `write`, `Bun.write`, `writeFile`, and `open(..., "w"/"a"/"x")`. A protected literal target goes through the same review flow as file tools: model analysis first, then the interactive dialog or a valid auto verdict. A computed target is also reviewed, not automatically allowed; headless calls are blocked before analysis.
 - OMP Eval's `tool.write({ path, content })` object form checks literal filesystem paths against protected-path rules. `agent://`, `xd://`, and `out://` targets are not filesystem paths; `xd://` host-tool invocations are reviewable and go through model analysis. Computed/unknown targets or unsupported object shapes are still reviewed rather than skipped. `proc://` writes are reviewed as unresolved non-file targets, except for the verified Task Group pool-cancel form.
-- Eval MCP calls are reviewed before the cell runs: direct `tool.mcp__<name>(...)` (JS and Python, including a static computed member such as `tool["mcp__x"]`), `mcp.evalNamespaces` globals such as `server.method(...)`, and static `tool.write({ path: "xd://mcp__..." })` dispatches. Statically identified MCP calls go through model analysis. Without a valid verdict, a UI session asks the user and a headless session blocks. A tool or namespace member that cannot be resolved statically (`tool[name]`, `server[method]`) or a direct host bridge call (`__omp_call_tool__`, `_bridge_call`) is also routed to review; headless calls without a valid verdict are blocked.
+- Eval MCP calls are reviewed before the cell runs: direct `tool.mcp__<name>(...)` (JS and Python, including a static computed member such as `tool["mcp__x"]`), `mcp.evalNamespaces` globals such as `server.method(...)`, and static `tool.write({ path: "xd://mcp__..." })` dispatches. Statically identified MCP calls are deny-tier and go through model analysis; without a valid verdict they block outright. A tool or namespace member that cannot be resolved statically (`tool[name]`, `server[method]`) or a direct host bridge call (`__omp_call_tool__`, `_bridge_call`) is also routed to review as confirmation-required: in auto mode with a UI an `allow` verdict executes while a `block` verdict or no verdict asks you; headless calls are blocked before analysis.
 
 ### 5. Decision memory
 
@@ -236,7 +240,7 @@ The extension never executes shell commands or Eval cells itself. OMP's same-nam
 - Eval checks the submitted cell, not the full retained kernel state. A helper defined in an earlier cell can call an MCP tool, bind a dynamic dispatcher, perform a process launch, or write without repeating the visible API in the current cell. `%run`/`%load` are routed to review because their source is not inspected, and no remembered decision is offered; retained-kernel state is not introspected, so this is not a sandbox.
 - MCP namespace recognition depends on the live host tool inventory exposing `mcpServerName` (OMP does while connected, including when `mcp.evalNamespaces` hides the server's top-level tools). If the inventory is unavailable, direct `tool.mcp__*` still matches the MCP prefix, but a non-prefixed namespace global cannot be attributed; a dynamic `tool[...]` dispatch is still routed to review. Globals that OMP renamed on a collision (for example `github_mcp`) are not reconstructed from the server name.
 - Eval MCP detection follows the submitted source text. Exotic indirection such as `globalThis["tool"]`, `getattr(tool, name)`, passing `tool` to a helper, or aliasing a namespace through another object is not classified. The gate is not a sandbox; review the cell rather than relying on a claim of complete MCP coverage.
-- Proc-service cwd is inferred from literal `cd`/`chdir` input after a successful `write proc://` result. OMP reports that input was sent, not whether a conditional or failing command changed cwd; indirect changes can desynchronize the inferred path. Unknown cwd is routed to review; without a valid verdict a UI session asks the user and a headless session blocks.
+- Proc-service cwd is inferred from literal `cd`/`chdir` input after a successful `write proc://` result. OMP reports that input was sent, not whether a conditional or failing command changed cwd; indirect changes can desynchronize the inferred path. Unknown cwd is routed to review as confirmation-required; without a valid verdict it still asks in a UI session (the deny-tier block does not apply) and blocks headless.
 - Eval code runs in a retained kernel, but the host resets the runner working directory to the session cwd before each cell, so a `chdir` does not carry into later cells. Literal `chdir`/`%cd` operations are resolved in source order for the hard-block check; computed targets are not resolved against the live runtime directory. A leading shell `cd` inside `!cmd`/`%%bash` is resolved against the effective base cwd. Same-cell dynamic `chdir` with relative writes remains review-worthy rather than statically classified. This is a gate on each submitted snippet, not live filesystem interception.
 - Python `%%writefile` targets are checked, but its body is file content, not shell code. A shell `cd` target that cannot be resolved before execution (for example, a symlink created earlier in the same input) requires review rather than a no-override hard block.
 - Bash hard-blocks file operands for `/etc/passwd`, `/etc/shadow`, and `/etc/sudoers`, including reads. Grep/rg patterns, sed/awk programs, and Git messages/search terms count as data.
@@ -309,7 +313,7 @@ Config lives at `~/.omp/agent/smart-approve.json` (or `~/.pi/agent/smart-approve
 }
 ```
 
-The legacy `coverage.hub` key is ignored. `autoFallback` is a legacy key: it is accepted and preserved for compatibility, but it no longer affects decisions. Without a usable model verdict, a UI session asks the user and a headless session blocks. No configuration migration is required.
+The legacy `coverage.hub` key is ignored. `autoFallback` is a legacy key: it is accepted and preserved for compatibility, but it no longer affects decisions. Without a usable model verdict, non-confirmation deny-tier operations block outright; the rest are asked in a UI session and blocked without one. No configuration migration is required.
 
 | Field | Default | Description |
 |---|---|---|
@@ -319,7 +323,7 @@ The legacy `coverage.hub` key is ignored. `autoFallback` is a legacy key: it is 
 | `autoInHeadless` | `false` | Auto mode in headless/subagent sessions: a valid model verdict may decide. With no valid verdict, the operation is blocked |
 | `coverage.eval` | `true` | Enable Eval analysis when the host exposes an Eval tool |
 | `protectedPaths` | 20+ built-in patterns | Glob patterns checked for write/edit/apply_patch/ast_edit and literal Eval helper writes. A match enters the normal review flow; system-sensitive files/devices remain hard-blocked even when empty |
-| `llmAnalysis` | `true` | Whether to invoke the model for risk analysis; `false` = static rules only. Reviewable operations then have no model verdict: a UI session asks the user and a headless session blocks |
+| `llmAnalysis` | `true` | Whether to invoke the model for risk analysis; `false` = static rules only. Reviewable operations then have no model verdict: non-confirmation deny-tier operations block outright; the rest are asked in a UI session and blocked without one |
 | `rememberDecisions` | `true` | Whether to offer remember options in the dialog |
 | `contextMaxChars` | `3000` | Max chars of session context to feed the model |
 | `analysisTimeoutMs` | `30000` | Chat: timeout per RPC attempt. Native decision: deadline for the whole analysis, including model-header resolution. `0` disables the plugin timeout; provider limits still apply |

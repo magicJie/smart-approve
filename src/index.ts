@@ -459,6 +459,8 @@ class SmartApprove {
     const needsReview = config.rememberDecisions
       ? protectedPaths.filter((target) => !this.allowList.isAllowed(event.toolName, target, cwd))
       : protectedPaths;
+    // needsReview contains only the protected targets not yet covered by a
+    // remembered human decision.
     if (needsReview.length === 0) return;
 
     const t = this.t;
@@ -479,9 +481,10 @@ class SmartApprove {
         // flow must review exactly `needsReview`, and remember each target.
         memoryKey: null,
         cwd,
-        // Local redesign: protected-path writes always need a human
-        // decision — no remembered shortcut, no auto verdict, headless
-        // blocks.  Model analysis still supplies dialog evidence.
+        // Protected-path writes require confirmation: no remembered
+        // shortcut, headless blocks.  In auto mode an allow verdict
+        // auto-allows; a block verdict or missing verdict still asks the
+        // human, with model analysis as dialog evidence.
         requiresConfirmation: true,
         rememberScope: "both",
         title,
